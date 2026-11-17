@@ -112,13 +112,16 @@ def merge_contiguous(records: List[Record], mode: str = "all") -> List[Record]:
       "none"     —— 不合并，完全按 PDF 的行来。
     """
     if mode == "none":
-        return sorted(copy.deepcopy(records), key=lambda r: (r.day, r.pfrom))
+        return sorted(copy.deepcopy(records),
+                      key=lambda r: (r.day, r.pfrom if r.pfrom is not None else 999))
 
     # 深拷贝：合并会改写 pfrom/pto/segments，绝不能污染调用方传进来的记录
     # （否则在界面上换一种合并模式重新生成，会用上一次改过的数据算出错误结果）
     records = copy.deepcopy(records)
 
     def can_merge(a: Record, b: Record) -> bool:
+        if a.pfrom is None or b.pfrom is None:   # 没有节次，谈不上「相连」
+            return False
         if b.pfrom > a.pto + 1:               # 不相连
             return False
         if mode == "all":
@@ -138,13 +141,15 @@ def merge_contiguous(records: List[Record], mode: str = "all") -> List[Record]:
 
     merged_all: List[Record] = []
     for k in order:
-        items = sorted(buckets[k], key=lambda z: (z.pfrom, z.pto))
+        items = sorted(buckets[k], key=lambda z: ((z.pfrom if z.pfrom is not None else 999),
+                                                  (z.pto if z.pto is not None else 999)))
         acc: List[Record] = []
         for r in items:
             if acc and can_merge(acc[-1], r):
                 last = acc[-1]
-                last.pfrom = min(last.pfrom, r.pfrom)
-                last.pto = max(last.pto, r.pto)
+                if last.pfrom is not None and r.pfrom is not None:
+                    last.pfrom = min(last.pfrom, r.pfrom)
+                    last.pto = max(last.pto, r.pto)
                 have = {(tuple(s.weeks), s.teacher) for s in last.segments}
                 for s in r.segments:
                     if (tuple(s.weeks), s.teacher) not in have:
@@ -163,34 +168,55 @@ def merge_contiguous(records: List[Record], mode: str = "all") -> List[Record]:
                 continue
             acc.append(r)
         merged_all.extend(acc)
-    merged_all.sort(key=lambda r: (r.day, r.pfrom))
+    merged_all.sort(key=lambda r: (r.day, r.pfrom if r.pfrom is not None else 999))
     return merged_all
 
 
 def _check_periods(records: List[Record], period_times: Dict[int, Tuple[str, str]]):
-    missing = sorted({p for r in records if not r.clock
+    """校验「每节课的时间」是否齐全。
+
+    规则：**节次时间以用户设定为准**。所以真正缺信息的是两类记录：
+      1. 有节次、但作息表里没有那一节的时间；
+      2. 没有节次、也没有从 PDF 反查出节次（只有 clock 或什么都没有）——
+         这种没法落到用户的时间上，必须让用户先解决，不能替他猜。
+    """
+    missing = sorted({p for r in records if r.has_periods()
                       for p in range(r.pfrom, r.pto + 1) if p not in period_times})
     if missing:
         raise IcsError(
-            "这些课程用到的节次没有上下课时间：%s\n"
+            "这些节次的上下课时间还没设置：%s\n"
             "  处理办法（任选）：\n"
             "    1) 界面点「节次时间…」补全（内置通用作息默认到第 %d 节，超出部分要自己填）；\n"
             "    2) 命令行 --period-times 13=21:45-22:30,14=22:40-23:25 这样指定；\n"
             "    3) 换一份自带该校作息的版式：--list-layouts 看有哪些。"
             % ("、".join(str(m) for m in missing),
                max(period_times) if period_times else 0))
+    stuck = [r for r in records if not r.has_periods()]
+    if stuck:
+        names = "、".join(sorted({r.course for r in stuck})[:6])
+        raise IcsError(
+            "这些课程没能确定是第几节，所以无法套用你设定的节次时间：%s\n"
+            "  它们的原因通常是：课表格子里只印了上下课时刻（如 800-935），"
+            "而该时刻对不上你设定的任何一节（允许 %d 分钟误差）。\n"
+            "  处理办法：核对「节次时间…」是否与本校作息一致，或在预览表里双击这几行手动改。"
+            % (names, 10))
 
 
 def class_times(r: Record, period_times: Dict[int, Tuple[str, str]]) -> Tuple[str, str]:
     """这门课几点上、几点下课。
 
-    版式直接把上下课时刻印在 PDF 上时（`Record.clock`）**以它为准** —— 那是原始数据，
-    比对着作息表按节次推算更可靠（走班课、一次连排 3 小时、临时调节课都可能不在作息表里）。
-    没有 clock 才回到节次时间表。
+    **以用户设定的节次时间为准**：课表上印的时刻只用来反查「这是第几节」
+    （parser.resolve_periods），真正落到日历上的时间来自用户自己的作息表。
+    这样同一份课表在不同学校的作息下都会落到用户配置的时间上。
+
+    只有在「有 clock 但反查不出节次」这种异常情况下才退回 clock —— 而且这种记录
+    在 _check_periods 里已经被拦住了，所以正常流程走不到这里。
     """
+    if r.has_periods():
+        return period_times[r.pfrom][0], period_times[r.pto][1]
     if r.clock:
         return r.clock
-    return period_times[r.pfrom][0], period_times[r.pto][1]
+    raise IcsError("「%s」既没有节次也没有上下课时刻，无法排进日历。" % r.course)
 
 
 def build_grid(records: List[Record]) -> Dict[Tuple[int, int], List[Record]]:
@@ -200,7 +226,7 @@ def build_grid(records: List[Record]) -> Dict[Tuple[int, int], List[Record]]:
         for w in r.all_weeks():
             grid.setdefault((w, r.day), []).append(r)
     for k in grid:
-        grid[k].sort(key=lambda z: z.pfrom)
+        grid[k].sort(key=lambda z: z.pfrom if z.pfrom is not None else 999)
     return grid
 
 
@@ -256,7 +282,8 @@ def build_day_map(records: List[Record], cfg: Config):
             makeup_added.append((m.date, r, week))
 
     for d in day_map:
-        day_map[d].sort(key=lambda z: (z[0].pfrom, z[0].course))
+        day_map[d].sort(key=lambda z: ((z[0].pfrom if z[0].pfrom is not None else 999),
+                                       z[0].course))
     return day_map, cancelled, makeup_added
 
 
@@ -329,8 +356,8 @@ def build_ics(result: ParseResult, cfg: Config):
         s_hm, e_hm = class_times(r, cfg.period_times)
         first = cfg.week1_monday + dt.timedelta(weeks=wf - 1, days=r.day)
 
-        desc = ["第%s周 ｜ %s 第%d-%d节 %s-%s" % (compress_weeks(weeks), r.day_name,
-                                              r.pfrom, r.pto, s_hm, e_hm),
+        desc = ["第%s周 ｜ %s %s %s-%s" % (compress_weeks(weeks), r.day_name,
+                                          r.period_desc(), s_hm, e_hm),
                 "教师：" + "；".join(r.teacher_desc()),
                 "地点：" + r.room]
         if r.code:
@@ -340,7 +367,7 @@ def build_ics(result: ParseResult, cfg: Config):
         if cfg.extra_description:
             desc.append(cfg.extra_description)
 
-        key = "%s|%s|%d|%d|%s" % (r.course, r.day_name, r.pfrom, r.pto, r.room)
+        key = "%s|%s|%s|%s|%s" % (r.course, r.day_name, r.pfrom, r.pto, r.room)
         uid = hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
         alarm = cfg.class_alarm_min if cfg.class_alarm_min else None
 
@@ -367,11 +394,10 @@ def build_ics(result: ParseResult, cfg: Config):
     # ---------- ①b 调休上班日补上的课（一般为空，取决于学校安排） ----------
     n_makeup = 0
     for (d, r, w) in makeup_added:
-        s_hm = cfg.period_times[r.pfrom][0]
-        e_hm = cfg.period_times[r.pto][1]
+        s_hm, e_hm = class_times(r, cfg.period_times)
         desc = ["%d月%d日（%s）调休上班，按第%d周%s课表执行"
                 % (d.month, d.day, WEEKDAY_SHORT[d.weekday()], w, r.day_name),
-                "第%d-%d节 %s-%s ｜ %s" % (r.pfrom, r.pto, s_hm, e_hm, r.room),
+                "%s %s-%s ｜ %s" % (r.period_desc(), s_hm, e_hm, r.room),
                 "教师：" + "；".join(r.teacher_desc())]
         vevent("makeup-%s-%s@nwpu.timetable"
                % (d.isoformat(), hashlib.sha1(r.key().encode("utf-8")).hexdigest()[:8]),

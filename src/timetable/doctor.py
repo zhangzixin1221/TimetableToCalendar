@@ -123,7 +123,7 @@ def diagnose(cfg: Config, result: ParseResult, n_weeks: int = None) -> List[Find
 
     # ---- 4. 节次时间是否齐全 ----
     # PDF 自己印了上下课时刻的课程（Record.clock）不依赖作息表，跳过不查
-    missing = sorted({p for r in result.records if not r.clock
+    missing = sorted({p for r in result.records if r.has_periods()
                       for p in range(r.pfrom, r.pto + 1) if p not in cfg.period_times})
     if missing:
         tip = ("在界面上点「编辑节次时间…」补全，或换一个作息预设。" if cfg.period_times

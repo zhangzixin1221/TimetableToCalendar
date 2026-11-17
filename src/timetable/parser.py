@@ -23,6 +23,7 @@
 """
 from __future__ import annotations
 
+import datetime as dt
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -62,17 +63,29 @@ class Record:
     day: int                    # 0=周一 … 6=周日
     course: str
     code: str
-    pfrom: int
-    pto: int
+    pfrom: Optional[int]        # None = 这份课表只印了时刻，没印第几节（待 resolve_periods 反查）
+    pto: Optional[int]
     room: str
     segments: List[Segment] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
-    # 版式直接印了上下课时刻时记在这里（如 08:00-09:40）；有它就优先于作息表
+    # 版式直接印了上下课时刻时记在这里（`08:00-09:35`）。节次时间以用户设定为准，
+    # 所以它主要用来**反查第几节**；反查不到时才作为最后的时间来源（并会明确报警）。
     clock: Tuple[str, str] | None = None
 
     @property
     def day_name(self) -> str:
         return WEEKDAY_SHORT[self.day]
+
+    def has_periods(self) -> bool:
+        return self.pfrom is not None and self.pto is not None
+
+    def period_desc(self) -> str:
+        """给日历/表预览用的人类可读节次。"""
+        if self.has_periods():
+            return "%d-%d节" % (self.pfrom, self.pto)
+        if self.clock:
+            return "%s-%s（未匹配到节次）" % self.clock
+        return "（无节次信息）"
 
     def all_weeks(self) -> List[int]:
         out = set()
@@ -105,7 +118,7 @@ class Record:
                 for t, w in sorted(by_teacher.items(), key=lambda kv: min(kv[1]))]
 
     def key(self) -> str:
-        return "%s|%s|%d|%d|%s" % (self.course, self.day_name, self.pfrom, self.pto,
+        return "%s|%s|%s|%s|%s" % (self.course, self.day_name, self.pfrom, self.pto,
                                    self.room)
 
 
@@ -184,7 +197,13 @@ def _collect_spans(page):
                 # 注意：纯空白的 span 必须保留 —— 它是「教室 / 教师」之间的分隔符
                 # （例如 "C座5楼" + " " + "向礼琴"），丢掉就会把教师并进教室名。
                 x0, y0, x1, y1 = sp["bbox"]
-                spans.append(dict(x0=x0, y0=y0, x1=x1, y1=y1,
+                # 行聚合要用**基线**（origin），不要用 bbox 的 y0：y0 取决于该行实际
+                # 字形（数字、全角括号、汉字的 ascender 各不相同），同一行里不同字号
+                # 或不同字符的行会差 1~2pt。实测一份 9pt 行距的课表，y0 抖动 1.7pt，
+                # 超过 2.5pt 容差的一半，相邻两行直接被并成一行 —— 于是课程名和详情行
+                # 粘在一起、整门课丢信息。基线对同一行是**精确相同**的，用它才稳。
+                base = sp["origin"][1] if "origin" in sp else y0
+                spans.append(dict(x0=x0, y0=y0, x1=x1, y1=y1, base=base,
                                   size=round(sp["size"], 2), text=sp["text"]))
     return spans
 
@@ -224,27 +243,40 @@ def _find_header(spans, lay: Layout):
 
 
 def _group_into_lines(items, tol: float) -> List[dict]:
-    """同一列内按 y 聚成「视觉行」。必须先分列再走这里（见模块 docstring）。"""
-    items = sorted(items, key=lambda z: (z["y0"], z["x0"]))
+    """同一列内按**基线**聚成「视觉行」。必须先分列再走这里（见模块 docstring）。
+
+    用 base（基线）而不是 bbox.y0：y0 受字形 ascender 影响，同一行能差 1~2pt，
+    在 9pt 行距的课表上足以把相邻两行误并（实测过）。基线对同一行精确相同。
+    """
+    items = sorted(items, key=lambda z: (z.get("base", z["y0"]), z["x0"]))
     lines: List[dict] = []
     for s in items:
-        if lines and abs(s["y0"] - lines[-1]["ybase"]) <= tol:
+        b = s.get("base", s["y0"])
+        if lines and abs(b - lines[-1]["ybase"]) <= tol:
             lines[-1]["spans"].append(s)
         else:
-            lines.append(dict(ybase=s["y0"], spans=[s]))
+            lines.append(dict(ybase=b, spans=[s]))
     for ln in lines:
         ln["spans"].sort(key=lambda z: z["x0"])
         # 空白折叠成一个空格，再去掉首尾
         ln["text"] = re.sub(r"\s+", " ", "".join(z["text"] for z in ln["spans"])).strip()
         ln["y"] = min(z["y0"] for z in ln["spans"])
         ln["size"] = round(max(z["size"] for z in ln["spans"]), 2)
-    lines.sort(key=lambda z: z["y"])
+    lines.sort(key=lambda z: z["ybase"])
     return lines
 
 
 # --------------------------------------------------------------------- parsing
-def parse_pdf(pdf_path: str, log=None, layout: Optional[Layout] = None) -> ParseResult:
-    """解析课表 PDF。`layout` 不传就是西工大版式（老行为，一字不变）。"""
+def parse_pdf(pdf_path: str, log=None, layout: Optional[Layout] = None,
+              period_times: Optional[Dict[int, Tuple[str, str]]] = None,
+              clock_tolerance_min: int = 10) -> ParseResult:
+    """解析课表 PDF。
+
+    `layout`      不传就用默认的通用版式。
+    `period_times` 用户设定的作息表（节次 -> 上下课时间）。只用于一件事：
+                  把「格子里只印了时刻」的课**反查**成第几节。节次时间以用户设定为准，
+                  PDF 上的时刻只是线索。不传就跳过反查（这类课会进 warnings）。
+    """
     def say(msg):
         if log:
             log(msg)
@@ -282,6 +314,28 @@ def parse_pdf(pdf_path: str, log=None, layout: Optional[Layout] = None) -> Parse
             % (lay.name, "、".join(k for k in REGISTRY.ids() if k != lay.id)))
 
     result.records = _dedupe(result.records)
+
+    # 「时刻制」课表：把只有时刻的记录反查成第几节（用用户设定的作息表）。
+    # 查不到的**不猜**，进 warnings，由调用方明确报错让用户补作息表。
+    if period_times:
+        result.records, unresolved = resolve_periods(result.records, period_times,
+                                                     clock_tolerance_min)
+        if unresolved:
+            result.warnings.append(
+                "这些课的格子里只印了上下课时刻，按你设定的作息表反查不到是第几节：%s。"
+                "请核对「节次时间…」是否和本校一致（也可以手动补全这些行）。"
+                % "；".join(unresolved[:6]))
+        else:
+            n = sum(1 for r in result.records if r.clock and r.has_periods())
+            if n:
+                result.notes.append(
+                    "%d 条课程的时刻已按作息表反查成节次（时刻→节次，允许 %d 分钟误差）。"
+                    % (n, clock_tolerance_min))
+    elif any(r.clock and not r.has_periods() for r in result.records):
+        result.warnings.append(
+            "这份课表只印了上下课时刻，没印第几节；但没有传入作息表，无法反查。"
+            "请先设定节次时间（界面「节次时间…」或 --period-times）。")
+
     say("版式：%s" % lay.name)
     say("解析到 %d 条课程安排。" % len(result.records))
     return result
@@ -347,34 +401,73 @@ def _is_note_line(text: str, size: float, entry_size: float, lay: Layout, rx: di
     return False
 
 
-def _parse_detail(text: str, lay: Layout, rx: dict, rest_of: str = "tail"):
-    """从一行文字里抠出 (周次, 起节, 止节, 剩下的部分)；不是详情行返回 None。
+def _hhmm_digits(s: str) -> str:
+    """`800` -> `08:00`，`1430` -> `14:30`，`935` -> `09:35`。
 
-    顺带把 `head`（周次/节次**之前**那一段）也带出来 —— 那基本就是课程名。
-    以前想单独写一条正则去猜课程名，结果 `(?P<course>.*?)(可选后缀)` 这种
-    「后缀全可选 + 懒惰匹配」只吃一个字符就宣告成功，课程名只剩一个字
-    （合成 PDF 实测）。几何信息都已经在这了，没必要再猜一次。
+    时刻制课表把上下课时间写成 3~4 位数字（不带冒号），必须补零还原成 HH:MM，
+    否则 ics 里会拼出畸形时间。
     """
-    if not (rx["weeks_re"] and rx["period_re"]):
+    s = (s or "").strip()
+    if len(s) == 3:
+        s = "0" + s
+    if len(s) != 4 or not s.isdigit():
+        raise ValueError("看不懂的时刻：%r" % (s,))
+    h, m = int(s[:2]), int(s[2:])
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        raise ValueError("时刻不合法：%r" % (s,))
+    return "%02d:%02d" % (h, m)
+
+
+def _parse_detail(text: str, lay: Layout, rx: dict, rest_of: str = "tail"):
+    """从一行文字里抠出 (周次, 起节, 止节, 剩下的部分, 时刻)；不是详情行返回 None。
+
+    支持两种「节次」表示：
+      * `(1-2节)`  —— 直接给了第几节；
+      * `(800-935)` —— 只给了上下课时刻（时刻制）。这时 pfrom/pto 为 None，
+        由后面的 resolve_periods() 按**用户设定的作息表**反查它是第几节。
+    顺带把 `head`（周次/节次**之前**那一段）也带出来 —— 那基本就是课程名。
+    """
+    if not rx["weeks_re"]:
         return None
-    wm, pm = rx["weeks_re"].search(text), rx["period_re"].search(text)
-    if not (wm and pm):
+    wm = rx["weeks_re"].search(text)
+    if not wm:
         return None
-    if pm.start() < wm.end():
-        # 节次出现在周次之前（"3-4节 1-16周"）时，rest 取两者的拼接之外那段
-        rest = text[pm.end():] + " " + text[:wm.start()]
-        head_end = min(pm.start(), wm.start())
+    pm = rx["period_re"].search(text) if rx["period_re"] else None
+    cm = None
+    if pm is None:
+        cm = (rx["clock_re"] or rx["clock_range_re"] or None)
+        cm = cm.search(text) if cm else None
+        if cm is None:
+            return None
     else:
-        cut = max(wm.end(), pm.end())
-        rest = text[cut:] if rest_of == "tail" else text[:wm.start()]
-        head_end = min(wm.start(), pm.start())
+        cm = None
+
+    spans = [(wm.start(), wm.end())]
+    pfrom = pto = None
+    clock = None
+    if pm is not None:
+        spans.append((pm.start(), pm.end()))
+        pfrom = int(pm.group("pfrom"))
+        pto = int(pm.group("pto")) if pm.groupdict().get("pto") else pfrom
+    else:
+        spans.append((cm.start(), cm.end()))
+        gd = cm.groupdict()
+        try:
+            if "m1" in gd:                      # 带冒号的 HH:MM-HH:MM
+                clock = ("%02d:%s" % (int(gd["h1"]), gd["m1"]),
+                         "%02d:%s" % (int(gd["h2"]), gd["m2"]))
+            else:                               # 不带冒号的 800-935
+                clock = (_hhmm_digits(gd["h1"]), _hhmm_digits(gd["h2"]))
+        except ValueError:
+            return None
+
+    cut = max(e for _, e in spans)
+    head_end = min(s for s, _ in spans)
+    rest = text[cut:] if rest_of == "tail" else text[:head_end]
     weeks = expand_weeks(int(wm.group("a")),
                          int(wm.group("b")) if wm.groupdict().get("b") else None,
                          wm.groupdict().get("parity"))
-    # 单节写法（"3节"）没有结束节次，起止相同 —— 通用版式放开括号后必须支持这个
-    pfrom = int(pm.group("pfrom"))
-    pto = int(pm.group("pto")) if pm.groupdict().get("pto") else pfrom
-    return dict(weeks=weeks, pfrom=pfrom, pto=pto,
+    return dict(weeks=weeks, pfrom=pfrom, pto=pto, clock=clock,
                 head=re.sub(r"[\s:：,，、\-]+$", "", text[:head_end]).strip(),
                 rest=re.sub(r"\s+", " ", rest).strip())
 
@@ -404,13 +497,15 @@ def _course_from_head(head: str, lay: Layout, rx: dict) -> Tuple[str, str]:
 
 
 # ---- block 模式：标题行 + 详情行（西工大） ------------------------------------
-def _entry_has_detail(ent: dict, rx: dict) -> bool:
-    """这一条目里是否已经有「(周次)(节次)」正文行。"""
-    for ln in ent["body"]:
-        if (rx["weeks_re"] and rx["period_re"]
-                and rx["weeks_re"].search(ln["text"]) and rx["period_re"].search(ln["text"])):
-            return True
-    return False
+def _entry_has_detail(ent: dict, lay: Layout, rx: dict) -> bool:
+    """这一条目里是否已经有「周次 + (节次 或 时刻)」的正文行。
+
+    以前这里只认「节次」，于是「时刻制」课表（格子只印 800-935）的正文行判不出来，
+    上一条目被当成「还没有正文的残段」，下一门课的标题就被拼进了它名字里 ——
+    实测课程名变成 `数学物理方法001数学物理方法`。直接用 _parse_detail 判断才对：
+    两条路径（节次/时刻）它就是唯一真相。
+    """
+    return any(_parse_detail(ln["text"], lay, rx) for ln in ent["body"])
 
 
 def _parse_block_column(day: int, lines: List[dict], lay: Layout, rx: dict,
@@ -428,7 +523,7 @@ def _parse_block_column(day: int, lines: List[dict], lay: Layout, rx: dict,
             # （完整的课至少有一行 (周次)(节次)），只能是名字的残段 —— 拼回来。
             # 只在字号相同的情况下拼，避免把小字号的脚注当成课程名的一部分。
             prev = entries[-1]
-            if (not prev["body"] or not _entry_has_detail(prev, rx)) \
+            if (not prev["body"] or not _entry_has_detail(prev, lay, rx)) \
                     and abs(ln["size"] - prev["size"]) <= 0.15:
                 prev["title"] = prev["title"] + ln["text"]
                 continue
@@ -510,6 +605,60 @@ def _parse_entry(day: int, ent: dict, lay: Layout, rx: dict,
                           pto=g["pto"], room=g["room"], segments=g["segments"],
                           notes=list(dict.fromkeys(notes))))
     return out
+
+
+def resolve_periods(records: List[Record], period_times,
+                    tolerance_min: int = 10) -> Tuple[List[Record], List[str]]:
+    """把「只有时刻、没有节次」的记录，按**用户设定的作息表**反查出第几节。
+
+    为什么反查而不是直接用 PDF 上的时刻：节次时间是用户按本校实际设的，那是唯一
+    权威来源；PDF 印的时刻只作为「这是第几节」的线索。这样同一份课表在不同学校的
+    作息下都能落到用户自己的时间上。
+
+    容差：教务系统印的区间常和作息表差几分钟（实测 `800-935` 对应 1-2 节
+    08:00-09:40，差 5 分钟）。默认允许 10 分钟，超过就对不上。
+
+    对不上**不猜**：留在 warnings 里交给调用方明确报错，宁可让用户去补作息表。
+    """
+    if not period_times:
+        return records, []
+    tol = dt.timedelta(minutes=tolerance_min)
+    unresolved: List[str] = []
+
+    def to_t(hhmm: str):
+        h, m = hhmm.split(":")
+        return dt.time(int(h), int(m))
+
+    for r in records:
+        if r.pfrom is not None or not r.clock:
+            continue
+        start, end = to_t(r.clock[0]), to_t(r.clock[1])
+        best = None
+        for a in sorted(period_times):
+            s, _e = period_times[a]
+            if abs(_delta_min(to_t(s), start)) > tolerance_min:
+                continue
+            # 从 a 起往后找，看能连续覆盖到哪一节
+            b = a
+            while b in period_times:
+                _s2, e2 = period_times[b]
+                if abs(_delta_min(to_t(e2), end)) <= tolerance_min:
+                    best = (a, b)
+                    break
+                b += 1
+            if best:
+                break
+        if best:
+            r.pfrom, r.pto = best
+        else:
+            unresolved.append("%s（格子里印的是 %s–%s）"
+                              % (r.course, r.clock[0], r.clock[1]))
+    return records, unresolved
+
+
+def _delta_min(a: dt.time, b: dt.time) -> float:
+    """两个时刻相差多少分钟（带符号，便于用 abs 判等）。"""
+    return ((a.hour * 60 + a.minute) - (b.hour * 60 + b.minute))
 
 
 # ---- inline 模式：每行自带课程名 ----------------------------------------------
@@ -749,7 +898,7 @@ def _parse_meta(page, lay: Layout, rx: dict) -> Meta:
 
 # ------------------------------------------------------------- 版式自动识别
 def detect_layout(pdf_path: str, reg: Optional[REGISTRY.__class__] = None,
-                  log=None) -> Tuple[Layout, List[str]]:
+                  log=None, period_times=None) -> Tuple[Layout, List[str]]:
     """挨个版式试解析，挑一个「解析得最完整」的。
 
     为什么要自动识别：用户不在乎版式叫什么，只在乎课表能不能导进日历。
@@ -771,7 +920,7 @@ def detect_layout(pdf_path: str, reg: Optional[REGISTRY.__class__] = None,
     notes: List[str] = []
     for lay in reg.all():
         try:
-            res = parse_pdf(pdf_path, layout=lay)
+            res = parse_pdf(pdf_path, layout=lay, period_times=period_times)
         except Exception as exc:                        # noqa: BLE001
             notes.append("  · %s：读不出来（%s）" % (lay.name, str(exc).splitlines()[0]))
             continue
@@ -812,6 +961,9 @@ def verify_parse(result: ParseResult) -> dict:
     conflicts = []
     for r in result.records:
         for w in r.all_weeks():
+            # 只有「时刻、没反查出节次」的记录无法做节次级冲突判定，跳过
+            if not r.has_periods():
+                continue
             for p in range(r.pfrom, r.pto + 1):
                 k = (w, r.day, p)
                 if k in slot and slot[k] != r.course:
@@ -833,7 +985,7 @@ if __name__ == "__main__":
     print("-" * 100)
     for r in res.records:
         print("%s 第%-5s %-30s 周次 %-12s %-24s %s" % (
-            r.day_name, "%d-%d节" % (r.pfrom, r.pto), r.course,
+            r.day_name, r.period_desc(), r.course,
             compress_weeks(r.all_weeks()), r.room, "；".join(r.teacher_desc())))
     print("-" * 100)
     print(verify_parse(res))

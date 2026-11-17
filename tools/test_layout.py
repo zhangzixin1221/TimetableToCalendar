@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 from timetable import holidays as hol_mod                    # noqa: E402
 from timetable import layout as lay_mod                      # noqa: E402
 from timetable import presets                                # noqa: E402
-from timetable.ics import Config, build_ics, merge_contiguous  # noqa: E402
+from timetable.ics import Config, IcsError, build_ics, merge_contiguous  # noqa: E402
 from timetable.parser import (Meta, ParseResult, Record, Segment,  # noqa: E402
                               compress_weeks, verify_parse)
 
@@ -249,16 +249,24 @@ cfg = Config(week1_monday=dt.date(2026, 8, 31),
 one = ParseResult(records=[rec(0, 1, 2, course="实验课", clock=("14:00", "16:30"))],
                   meta=Meta(term="2026-2027 秋"))
 text, stats = build_ics(one, cfg)
-check("有 clock 就用 PDF 上的时刻", "DTSTART;TZID=Asia/Shanghai:20260831T140000" in text,
-      "找不到 14:00 开头")
-check("下课时刻也来自 clock", "T163000" in text)
-# 作息表里压根没有这门课的节次，但因为 PDF 自带时刻，照样能生成
-nocfg = Config(week1_monday=dt.date(2026, 8, 31), period_times={},
-               class_alarm_min=None, night_summary=False)
-t2, _ = build_ics(ParseResult(records=[rec(0, 7, 8, course="夜航",
-                                          clock=("19:00", "22:00"))], meta=Meta()), nocfg)
-check("作息表是空的也能生成（只要 PDF 自带时刻）",
-      "T190000" in t2 and "T220000" in t2)
+# 新契约：**节次时间是用户设定的**，课表上印的时刻只用来反查第几节。
+# 所以有节次时，日历时间取用户作息表的 08:30-10:10，而不是 PDF 上印的 14:00-16:30。
+check("有节次时以用户作息表为准（不用 PDF 上印的时刻）",
+      "DTSTART;TZID=Asia/Shanghai:20260831T083000" in text
+      and "T101000" in text,
+      "没找到 08:30-10:10")
+check("PDF 上印的时刻不会混进日历时间",
+      "T140000" not in text)
+# 有节次、但作息表里没有这一节 → 必须报错（不能拿时钟顶上，那等于绕开用户的设定）
+try:
+    build_ics(ParseResult(records=[rec(0, 7, 8, course="夜航",
+                                       clock=("19:00", "22:00"))], meta=Meta()),
+              Config(week1_monday=dt.date(2026, 8, 31), period_times={},
+                     class_alarm_min=None, night_summary=False))
+    check("作息表缺这一节时必须报错（不拿 PDF 时刻顶替）", False, "竟然生成成功了")
+except IcsError as exc:
+    check("作息表缺这一节时必须报错（不拿 PDF 时刻顶替）",
+          "节次" in str(exc), str(exc)[:70])
 try:
     build_ics(ParseResult(records=[rec(0, 9, 9, course="没作息")], meta=Meta()),
               Config(week1_monday=dt.date(2026, 8, 31), period_times={},

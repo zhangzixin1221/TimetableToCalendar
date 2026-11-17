@@ -152,9 +152,14 @@ def _classify_line(ln, lay, rx, body, ci):
     d = _parse_detail(text, lay, rx) if lay.entry_mode != "table" else None
     if d:
         room, teacher = lay_mod.split_room_teacher(d["rest"], lay.room_teacher)
-        extra = ("周次 %s  节次 %d-%d  →  教室=%r 教师=%r  剩余=%r"
-                 % (_fmt_weeks(d["weeks"]), d["pfrom"], d["pto"],
-                    room, teacher, d["rest"]))
+        if d.get("pfrom") is not None:
+            where = "节次 %d-%d" % (d["pfrom"], d["pto"])
+        elif d.get("clock"):
+            where = "时刻 %s-%s（待用作息表反查节次）" % d["clock"]
+        else:
+            where = "节次/时刻都没认出来"
+        extra = ("周次 %s  %s  →  教室=%r 教师=%r  剩余=%r"
+                 % (_fmt_weeks(d["weeks"]), where, room, teacher, d["rest"]))
         return "详情行", extra
     if rx["title_re"] and rx["title_re"].match(text) and not rx["codelist_re"].match(text):
         return "标题行", ""

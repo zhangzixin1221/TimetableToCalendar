@@ -192,11 +192,34 @@ def main(argv=None) -> int:
         print(dump_pdf(args.pdf, lay))
         return 0
 
+    # ---- 作息：必须在解析**之前**定好 ----
+    # 「时刻制」课表（格子里只印 800-935 这种时刻）要靠用户设定的作息表反查第几节，
+    # 所以作息得先于 parse_pdf 确定下来。
+    names = presets.preset_names(lay)
+    preset_name = args.preset or presets.default_preset_name(lay)
+    if names and preset_name not in names and not args.period_times:
+        print("错误：版式「%s」没有叫「%s」的作息预设，可用：%s"
+              % (lay.name, preset_name, "、".join(names)), file=sys.stderr)
+        return 2
+    period_times = presets.get_preset(preset_name, lay) if names else {}
+    if args.period_times:
+        try:
+            period_times.update(_periods_from_arg(args.period_times))
+        except ValueError as exc:
+            print("错误：%s" % exc, file=sys.stderr)
+            return 2
+    if args.period_times:
+        log("作息时间：%s（%s）" % (preset_name if names else "版式未自带",
+                                    "已用 --period-times 覆盖"))
+    elif names:
+        log("作息时间：%s" % preset_name)
+
     # ---- 解析 ----
     try:
         if args.auto_layout:
-            lay, _ = detect_layout(args.pdf, log=log)
-        result = parse_pdf(args.pdf, log=log, layout=lay)
+            lay, _ = detect_layout(args.pdf, log=log,
+                                   period_times=period_times)
+        result = parse_pdf(args.pdf, log=log, layout=lay, period_times=period_times)
     except Exception as exc:                        # noqa: BLE001
         print("解析失败：%s" % exc, file=sys.stderr)
         return 1
@@ -222,25 +245,7 @@ def main(argv=None) -> int:
         % (len(result.records), len(merged), args.merge))
     log("第 1 周周一 = %s，版式 = %s" % (week1, lay.name))
 
-    # ---- 作息 ----
-    names = presets.preset_names(lay)
-    preset_name = args.preset or presets.default_preset_name(lay)
-    if names and preset_name not in names and not args.period_times:
-        print("错误：版式「%s」没有叫「%s」的作息预设，可用：%s"
-              % (lay.name, preset_name, "、".join(names)), file=sys.stderr)
-        return 2
-    period_times = presets.get_preset(preset_name, lay) if names else {}
-    if args.period_times:
-        try:
-            period_times.update(_periods_from_arg(args.period_times))
-        except ValueError as exc:
-            print("错误：%s" % exc, file=sys.stderr)
-            return 2
-    if args.period_times:
-        log("作息时间：%s（%s）" % (preset_name if names else "版式未自带",
-                                    "已用 --period-times 覆盖"))
-    elif names:
-        log("作息时间：%s" % preset_name)
+    # ---- 作息已在解析前确定（见上），这里不再重复 ----
 
     try:
         alarm = int(args.alarm)

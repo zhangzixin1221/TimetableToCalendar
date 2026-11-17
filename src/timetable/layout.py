@@ -44,6 +44,7 @@ GROUPS_ALLOWED = {
     "weeks_re": {"a", "b", "parity"},
     "period_re": {"pfrom", "pto"},
     "clock_re": {"h1", "m1", "h2", "m2"},
+    "clock_range_re": {"h1", "h2"},
     "detail_course_re": {"course", "code"},
 }
 
@@ -122,6 +123,21 @@ _SCHEDULE_NOISE = re.compile(r"^[0-9〇一二三四五六七八九十,\-~—–(
 # 却肯定是教室而不是人名；早先要求教室必须含数字，这类全被判成「教师在前」失败）
 _PLACE_TAIL = re.compile(r"(楼|室|馆|场|厅|区|中心|基地|堂|园|教室|车间|体育场|体育馆|音乐厅)$")
 
+# 教室与教师**粘在一起**、中间连空格都没有的情况：`040401钱渝`、`10205*温建萍`、
+# `2010205*黄武英`、`4号楼2040401钱渝`。这是「时刻制」课表（如安师大）的典型写法 ——
+# 靠空格切分的所有策略在这种行上都会整体失败（把教师并进教室名）。
+# 切法：结尾那段 2~4 个汉字是教师，前面（必须以数字/字母/星号结尾）是教室。
+# 关键的两个否定条件（都实测踩过）：
+#   * 教师段不能是「号楼」「体育馆」这类地点词 —— 否则 `1号楼` 会被拆成 教室=1、教师=号楼；
+#   * 教室段必须含数字/字母 —— 否则 `翱翔体育馆` 会被当成「教室=翱翔体育 教师=馆」。
+_GLUED_ROOM_TEACHER = re.compile(
+    r"^(?P<room>.*[0-9A-Za-z*#])"
+    r"(?P<teacher>[\u4e00-\u9fff·]{2,4}(?:[/／、,，][\u4e00-\u9fff·]{2,4})*)$")
+# 教师串里可能有多个（`金伟/何淼/朱仁贵`）
+_MULTI_TEACHER = re.compile(r"^[\u4e00-\u9fff·]{2,4}(?:[/／、,，][\u4e00-\u9fff·]{2,4})*$")
+# 这些词尾说明「这段是地点，不是人名」
+_NOT_A_NAME_TAIL = re.compile(r"(号楼|楼|室|馆|场|厅|区|中心|基地|堂|园|号|层|校区)$")
+
 
 def _looks_like_room(tok: str) -> bool:
     return bool(re.search(r"[0-9A-Za-z]", tok)) or bool(_PLACE_TAIL.search(tok))
@@ -141,6 +157,19 @@ def _space_tail_auto(rest: str, squeeze) -> Tuple[str, str]:
     parts = rest.split()
     if not parts:
         return "", ""
+    # 先试「完全粘连」：整段就是 `教室+教师`，中间没有任何空格。
+    # **必须先确认真的没有空格** —— 否则会把正常用空格分隔的
+    # `实验大楼C座5楼 向礼琴` 也按「数字与汉字的分界」切开，得到
+    # 教室=`实验大楼C座5`、教师=`楼向礼琴`（实测踩过）。
+    if len(parts) > 1:
+        whole = None
+    else:
+        whole = rest.strip()
+    if whole:
+        mg = _GLUED_ROOM_TEACHER.match(whole)
+        if mg and _MULTI_TEACHER.match(mg.group("teacher")) \
+                and not _NOT_A_NAME_TAIL.search(mg.group("teacher")):
+            return squeeze(mg.group("room")), squeeze(mg.group("teacher"))
     if len(parts) == 1:
         return squeeze(parts[0]), ""
     last, prev = parts[-1], parts[-2]
@@ -216,7 +245,10 @@ class Layout:
     weeks_token_re: Optional[str] = None       # 宽松周次（供 expand_weeks_token 用）
     period_re: Optional[str] = r"\((?P<pfrom>\d+)\s*-\s*(?P<pto>\d+)\s*节\)"
     period_list_re: Optional[str] = None       # 「1,3,5节」这类（table 模式常见）
-    clock_re: Optional[str] = None             # 直接印了上下课时刻的版式
+    clock_re: Optional[str] = None             # 直接印了上下课时刻（HH:MM-HH:MM）
+    # 不带冒号的时刻区间，如 `(800-935)` = 8:00–9:35。有些教务系统把上下课时刻
+    # 直接印在格子里而**不印第几节**，这是「时刻制」课表的核心特征。
+    clock_range_re: Optional[str] = None
 
     # --- 切分与噪声
     room_teacher: str = "space_tail_name"
@@ -281,7 +313,8 @@ class Layout:
             out[fname] = rx
         for fname in ("note_words_re", "codelist_re", "skip_text_re", "body_end_re",
                       "term_re", "credits_re", "print_date_re", "remark_re",
-                      "remark_head_re", "weeks_token_re", "period_list_re"):
+                      "remark_head_re", "weeks_token_re", "period_list_re",
+                      "clock_re", "clock_range_re"):
             pat = getattr(self, fname, None)
             if not pat:
                 out[fname] = None
@@ -406,13 +439,18 @@ GENERIC_PERIODS = {str(i): list(v) for i, v in {
 GENERIC = Layout(
     id="generic",
     name="通用课表（自动判断结构）",
-    note="不假设具体学校：括号可有可无、节次可单节、教室与教师谁在前由程序判断。"
+    note="不假设具体学校：括号可有可无、节次可单节也可只印时刻、课程代码 2~4 位、"
+         "教室与教师谁在前（甚至粘连在一起）由程序判断。"
          "对不上时用「看结构」看程序眼里的版面，再写一份版式文件。",
     entry_mode="block",
     specificity=25,                 # 比写死括号的版式宽松，但结构要求仍然具体
+    # 课程代码放宽到 2~4 位（`078`、`001`、`20`），并允许代码前有空格或全角括号
+    title_re=r"^[^(\s].*?[\s（(]?(?P<code>\d{2,4})$",
     weeks_re=r"[(（]?(?P<a>\d{1,2})(?:\s*[-~—–至]\s*(?P<b>\d{1,2}))?"
              r"\s*(?:[(（](?P<parity>[单双])[)）])?\s*周[)）]?",
     period_re=r"[(（]?(?P<pfrom>\d{1,2})(?:\s*[-~—–至]\s*(?P<pto>\d{1,2}))?\s*节[)）]?",
+    # 时刻制：`(800-935)` = 8:00–9:35，`(1430-1655)` = 14:30–16:55
+    clock_range_re=r"[(（]?(?P<h1>\d{3,4})\s*[-~—–]\s*(?P<h2>\d{3,4})[)）]?",
     room_teacher="auto",
     period_presets={"通用作息（45 分钟/节，可编辑）": GENERIC_PERIODS},
     default_preset="通用作息（45 分钟/节，可编辑）",

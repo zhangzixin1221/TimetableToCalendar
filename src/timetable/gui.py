@@ -1034,9 +1034,12 @@ class App(tk.Tk):
             if self.var_auto_layout.get():
                 from .parser import detect_layout
                 self.log("自动识别版式…")
-                lay, _notes = detect_layout(pdf, log=self.log)
+                lay, _notes = detect_layout(pdf, log=self.log,
+                                            period_times=self.period_times)
                 self._apply_layout(lay, quiet=True)
-            self.result = parse_pdf(pdf, log=self.log, layout=self.layout)
+            # 把用户设定的作息表带进解析：时刻制课表要靠它反查第几节
+            self.result = parse_pdf(pdf, log=self.log, layout=self.layout,
+                                    period_times=self.period_times)
         except Exception as exc:                       # noqa: BLE001
             self.log("解析失败：%s" % exc)
             self._set_status("解析失败", "err")
@@ -1081,10 +1084,11 @@ class App(tk.Tk):
     def _row_values(self, r: Record):
         pt = self.period_times
         try:
-            t = "%s-%s" % (pt[r.pfrom][0], pt[r.pto][1])
+            t = ("%s-%s" % (pt[r.pfrom][0], pt[r.pto][1])) if r.has_periods() \
+                else (("%s-%s" % r.clock) if r.clock else "（未设置）")
         except KeyError:
             t = "（未设置）"
-        return (r.day_name, r.course, r.code, "%d-%d节" % (r.pfrom, r.pto), t,
+        return (r.day_name, r.course, r.code, r.period_desc(), t,
                 weeks_to_expr(r.all_weeks()), r.room, "；".join(r.teacher_desc()))
 
     # ------------------------------------------------------------------ 表格编辑
@@ -1322,7 +1326,7 @@ class _RecordDialog(_BaseDialog):
 
         vals = {
             "day": rec.day_name, "course": rec.course, "code": rec.code,
-            "period": "%d-%d" % (rec.pfrom, rec.pto),
+            "period": "%d-%d" % (rec.pfrom, rec.pto) if rec.has_periods() else "",
             "weeks": weeks_to_expr(rec.all_weeks()),
             "room": rec.room,
             "teacher": "；".join(rec.teacher_desc()),
