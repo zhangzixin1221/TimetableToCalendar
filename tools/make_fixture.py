@@ -13,7 +13,7 @@
     python tools/make_fixture.py -o 某路径.pdf        # 指定输出
     python tools/make_fixture.py --dump              # 打印自己造出来的 span 清单
     python tools/make_fixture.py --check             # 生成 + 解析 + 断言（回归入口）
-    python tools/make_fixture.py --longname-trap     # 额外造「长课程名换行」陷阱样例
+    python tools/make_fixture.py --longname-trap     # 生成并断言长名换行哨兵样例
 
 `--check` 全部通过退出码 0；任何一条断言失败都会打印期望/实际并抛 AssertionError。
 
@@ -44,7 +44,9 @@
       `制图中心A区 袁斌`、`友谊西外A-302 王小明`、`翱翔体育馆 张伟`（2 字名）、
       `崔明轩`/`唐伯涛`/`陈明远`（3 字名）。
   F.  **多 span 拼一行**（最关键）：教室与教师之间**单独 `insert_text(" ")`**，
-      绝不图省事把整行一次写完；教室/教师的边界完全靠这些空白 span 撑开。
+       绝不图省事把整行一次写完，并且空白段后面刻意留 1 em 空隙（`SEG_GAP_EM`），
+       否则 MuPDF 会把首尾相接的同字号文字并成一个 span；留了空隙读回来才是
+       真的多 span 结构（`'实验大楼C座5楼 '` + `'向礼琴'`），边界全靠空白 span 撑开。
   G.  正文行换行续行**三种**（三种断行点各一处，覆盖 rest 拼接的全部路径）：
       ① 多数课用 `break="after_period"`：第一行只有 `(1~16周)(1-2节)`，
          第二行 `教室 教师`（续行内自带分隔空格）；
@@ -56,7 +58,7 @@
       `毛泽东思想和中国特色社会主义` / `理论体系概要08`，靠 parser 的残段拼接并回
       一条完整课程（坑 1 已修）。这种条目必须是**所在列的第一行**，原因见坑 1。
   I.  说明行（两种判定机制各一处）：
-      ① 小字号 5.8pt：`分级教学B班`、`2024级本科公共课`（< 标题 6.5 − 0.15）；
+       ① 小字号 4.6pt：`分级教学B班`、`2024级本科公共课`（< 标题 5.2 − 0.15）；
       ② 与标题同字号、靠关键词：`大物实验`（NOTE_WORD_RE 的 `^大物实验$`）。
   J.  标题两种写法：`高等数学A(上)06`（紧贴两位数字）与 `大学英语 12`（空格 + 数字）。
   K.  备注区 2 门无固定时间课程：`军事理论 HKJS101.01 (1~8)`、
@@ -107,11 +109,15 @@
     所以同一视觉行里混用字号会让各 span 的 y0 相差 `|Δsize|`，字号差 > 2.5 就断成
     两行 → 同一行的所有段必须同字号。跨行行距取 8.6pt（> 2.5 ✓）。
 
-坑 4 —— MuPDF 会合并「同字号、同基线、几乎相接」的多个 insert_text
-    `"教室" + " " + "教师"` 可能回来成 `"教室"` + `" 教师"` 两个 span（空格留在文字里），
-    与真实 PDF 的三 span 结构对 parser 等价（它按 x0 拼接同行后再折叠空白）。
-    真正要防的是**跨列粘连**：两段文字横向离得太近会被并成一个 span，整段就跑到左边
-    那一列去了。所以每行都算总宽度并断言不许越过格子右边界（`_guard_lines`）。
+坑 4 —— MuPDF 会合并「同字号、同基线、首尾相接」的多个 insert_text（实测阈值 0.8em）
+    三段式画的 `"教室" + " " + "教师"`，如果段与段严丝合缝地接，读回来会变成**一个**
+    span（`"实验大楼C座5楼 向礼琴"`，空格还在文字里）—— 对 parser 是等价的（它按 x0
+    拼接同行再折叠空白），但「多 span 拼一行」这条真实结构就测不到了。实测：段间留
+    ≥0.8em 空隙才会真的断成两个 span，所以 `SEG_GAP_EM = 1.0`，画回来是
+    `'实验大楼C座5楼 '` + `'向礼琴'`（空格挂在前一段尾巴上），跟真实导出一致。
+    另一半风险是**跨列粘连**：两段文字横向离得太近会被并成一个 span，而 parser 只按
+    span 的 x0 定列 → 整段跑到左边那一列。所以每行都算总宽度，既不许超预算也不许
+    越过格子右边界（`_guard_lines`，超了直接 SystemExit）。
 
 坑 5 —— 打印日期：正则以前只认 `[\\d/]`，现在放宽到 `[\\d/\\-.]+`
     旧版 `打印日期\\s*[:：]?\\s*([\\d/]+)` 遇到连字符日期只会抓到
@@ -119,6 +125,12 @@
     抓全。本 fixture 仍用**斜杠形式**（与这条正则最初的写法一致），断言照实写死；
     连字符形式要不要覆盖，得先确认真实导出到底用哪一种，再改这里一行 —— 不要两种
     都画（`_parse_meta` 取第一个命中，两个都在反而看不出问题）。
+坑 6 —— 空白 span 真的有用（反证过）
+    把同一行改成「整行一次写完」（`实验大楼C座5楼向礼琴`，中间不画空格），解析立刻
+    退化成 `room='实验大楼C座5楼向礼琴'`、`teacher=''` —— 教师被教室吃掉。所以本脚本
+    坚持「教室 / 空格 / 教师」三段式画法，`check()` 里也有「没有教师被并进教室」的
+    汇总断言。
+
 坑 7 —— `insert_text(china-s)` 每个字符都按**全角 1 em** 推进（含数字/括号/空格）
     内置 CJK 字体走 CID 默认 W 数组：`Font.text_length` 给的是比例宽度，只有实际的
     一半左右（"教西D-101" 实测推进 9 em，text_length 只算出 4.6 em）。照比例宽度
@@ -128,12 +140,6 @@
     （parser 只看 x0/y0/size）；副作用是 `(1~8周)(5-6节) 教西D-101` 这种 20 字符行
     放不下，所以 after_room 那格换了 5 个字的教室名 —— `_guard_lines` 会把这个约束
     硬性卡住，改数据时超宽会直接 SystemExit 而不是悄悄叠字。
-
-坑 6 —— 空白 span 真的有用（反证过）
-    把同一行改成「整行一次写完」（`实验大楼C座5楼向礼琴`，中间不画空格），解析立刻
-    退化成 `room='实验大楼C座5楼向礼琴'`、`teacher=''` —— 教师被教室吃掉。所以本脚本
-    坚持「教室 / 空格 / 教师」三段式画法，`check()` 里也有「没有教师被并进教室」的
-    汇总断言。
 
 本脚本对 parser 的当前状态做**实时**验证：`--check` 直接 import 工作区里的
 `src/timetable/`，所以 parser 一改（例如正则、告警措辞变了）就能立刻在这里暴露出来。
@@ -379,11 +385,17 @@ def _w(font, text, size):
 
 
 def draw_line(page, font, x, baseline, segs, size, lines_out, day):
-    """一行拆成多个 span 画；空白段单独 `insert_text(" ")`。"""
+    """一行拆成多个 span 画；空白段单独 `insert_text(" ")`。
+
+    空白段后面额外留 `SEG_GAP_EM` em，否则 MuPDF 会把首尾相接的同字号文字并成一个
+    span，「多 span 拼一行」这条真实结构就测不到了（见坑 4）。
+    """
     cur = x
     for seg in segs:
         page.insert_text((cur, baseline), seg, fontname=FONT, fontsize=size)
-        adv = _w(font, seg, size)          # 每字符 1 em，段与段正好首尾相接
+        adv = _w(font, seg, size)          # 每字符 1 em
+        if not seg.strip():
+            adv += SEG_GAP_EM * size       # 额外空隙，把 span 断开
         lines_out.append(dict(day=day, text=seg, x0=cur, x1=cur + adv,
                               y=baseline, size=size))
         cur += adv
@@ -859,7 +871,7 @@ def main(argv=None):
     ap.add_argument("--dump", action="store_true", help="打印生成后的 span 清单")
     ap.add_argument("--check", action="store_true", help="生成 + 解析 + 断言（回归入口）")
     ap.add_argument("--longname-trap", action="store_true",
-                    help="额外生成并断言「长课程名换行」陷阱样例")
+help="额外生成并断言「长课程名换行」回归哨兵样例（修复后的正确行为）")
     args = ap.parse_args(argv)
 
     path, spans = build(args.out)

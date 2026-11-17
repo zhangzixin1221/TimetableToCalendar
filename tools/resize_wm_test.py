@@ -71,10 +71,14 @@ for (W, H) in sizes:
         problems.append("预览表被压扁 %d" % tree_h)
     if log_h <= ui.px(30):
         problems.append("日志被压扁 %d" % log_h)
-    # 滚动条状态必须和内容高度一致
-    want_sb = app._inner.winfo_reqheight() > app._canvas.winfo_height() + app._sc_slack
+    # 滚动条状态必须和内容高度一致（容差 1px，与 gui._sync_scroll 同一口径）
+    want_sb = app._inner.winfo_reqheight() > app._canvas.winfo_height() + 1
     if want_sb != app._sb_shown:
         problems.append("滚动条状态不对 需要=%s 实际=%s" % (want_sb, app._sb_shown))
+    # 内容不许被裁：内层高度必须托住内容自然高（以前用小容差压缩内层，底部会够不着）
+    if app._inner.winfo_height() + 2 < app._inner.winfo_reqheight():
+        problems.append("内层高度没托住内容 内层%d 需要%d"
+                        % (app._inner.winfo_height(), app._inner.winfo_reqheight()))
     if app._sb_shown and not (app._canvas.yview()[1] <= 1.0):
         problems.append("yview 异常 %s" % (app._canvas.yview(),))
     if problems:

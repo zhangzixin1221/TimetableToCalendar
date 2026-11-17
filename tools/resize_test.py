@@ -134,12 +134,18 @@ for (lw, lh) in SIZES:
             problems.append("卡片底图未跟上尺寸 卡片%dx%d 图%dx%d" % (cw, ch, iw, ih))
 
     # 3) 滚动条状态要和「内容高度 vs 可视高度」一致
+    # 判据与 gui._sync_scroll 保持一致：内容高于可视（容差 1px）就必须有滚动条，
+    # 否则底部内容不可达。以前这里用 _sc_slack 容差，那套口径已被判定为错的。
     view_h = app._canvas.winfo_height()
     need = app._inner.winfo_reqheight()
-    want_sb = need > view_h + app._sc_slack
+    want_sb = need > view_h + 1
     if want_sb != app._sb_shown:
         problems.append("滚动条状态不对 需要=%s 实际=%s (内容%d 可视%d)"
                         % (want_sb, app._sb_shown, need, view_h))
+    # 内容不许被裁：内层高度必须 >= 内容自然高（除非窗口本身比最小尺寸还小）
+    inner_h = app._inner.winfo_height()
+    if inner_h + 2 < need:
+        problems.append("内层被压缩导致内容被裁 内层%d 内容需要%d" % (inner_h, need))
     if app._sb_shown and app._vsb.winfo_width() <= 1:
         problems.append("滚动条显示了但宽度是 0")
 

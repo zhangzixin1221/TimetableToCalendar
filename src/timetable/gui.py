@@ -143,7 +143,6 @@ class App(tk.Tk):
         # 画布先只占位不 pack：滚动条是否需要，等布局算完再决定（见 _sync_scroll）
         self._canvas.pack(fill="both", expand=True)
         self._sb_shown = False
-        self._sc_slack = ui.px(24)   # 允许内容被压缩这么多，不急着显示滚动条
 
         self._inner = tk.Frame(self._canvas, bg=P["bg"])
         self._inner_id = self._canvas.create_window((0, 0), window=self._inner,
@@ -170,7 +169,7 @@ class App(tk.Tk):
         # 内层宽度跟着画布走（卡片横向填满），高度取「内容自然高」和「画布高」的较大值：
         # 窗口拉高时预览表跟着变高，窗口压矮时内容保持自然高、由滚动条兜住。
         self._canvas.itemconfigure(self._inner_id, width=event.width)
-        self._sync_scroll(event.height)
+        self._settle()
         # 宽度变化可能让配置卡里的提示文字换行 → 需要的高度变了，再校一次
         self.after_idle(lambda: self._sync_scroll(self._canvas.winfo_height()))
 
@@ -183,20 +182,41 @@ class App(tk.Tk):
             return
         if view_h <= 1:
             return
-        # 差得不多时先让预览表被压一点（它是可伸缩的那一块），别为几像素就冒出滚动条
-        slack = self._sc_slack
-        want_sb = need > view_h + slack
-        self._canvas.itemconfigure(self._inner_id,
-                                   height=need if want_sb else view_h)
-        if want_sb == self._sb_shown:
+        inner_h = max(view_h, need)
+        self._canvas.itemconfigure(self._inner_id, height=inner_h)
+        # 容差 1px 只为吸收取整误差；超出就必须有滚动条，否则底部不可达。
+        want_sb = need > view_h + 1
+        if want_sb != self._sb_shown:
+            # 只在状态真的改变时动 pack，否则 Configure 会和布局互相触发打转
+            self._sb_shown = want_sb
+            if want_sb:
+                self._vsb.pack(side="right", fill="y", before=self._canvas)
+            else:
+                self._vsb.pack_forget()
+                self._canvas.yview_moveto(0)
+        return abs(inner_h - need) <= 1
+
+    def _settle(self, rounds: int = 3):
+        """在接下来几轮空闲期里反复校准内层高度。
+
+        为什么不能「校一次、觉得对齐了就收工」：宽度变化会让提示文字重新换行，而新的
+        自然高是 Tk 在空闲期才排出来的，所以第一次 _sync_scroll 读到的 need 还是旧值，
+        它会如实报告「已经对齐了」（因为那时确实对齐），然后**再也没有任何事件**来叫我们
+        再算一次 —— 内层就停在旧高度上，底部几十像素既看不见也滚不到（实测最小尺寸下
+        内层 1627、内容其实要 1652，预览表被压到 307）。这里无条件多跑几轮空闲期：
+        每轮都幂等，代价可忽略，换来的是「不管重排发生在第几个空闲周期，最后一定收敛」。
+        """
+        if rounds <= 0:
             return
-        # 只在状态真的改变时动 pack，否则 Configure 会和布局互相触发打转
-        self._sb_shown = want_sb
-        if want_sb:
-            self._vsb.pack(side="right", fill="y", before=self._canvas)
-        else:
-            self._vsb.pack_forget()
-            self._canvas.yview_moveto(0)
+        # 先把挂起的几何重排跑完，再读 winfo_reqheight —— 否则读到的是**重排前**的旧值，
+        # 而这正是这个函数存在的理由（见上面的注释）。update_idletasks 只处理空闲任务，
+        # 不处理用户事件，不会重入我们的回调。
+        try:
+            self.update_idletasks()
+        except Exception:                              # noqa: BLE001
+            pass
+        self._sync_scroll(self._canvas.winfo_height())
+        self.after_idle(lambda: self._settle(rounds - 1))
 
     def _on_wheel(self, event):
         """滚轮：预览表和日志自己滚，其余位置翻整页。"""
@@ -379,13 +399,22 @@ class App(tk.Tk):
             side="left", padx=(ui.SPACE["sm"], 0))
 
         # ---- 提示行 ----
+        # 这两条提示会随文字长度换行，是配置卡高度跳变的来源。它们的 <Configure>
+        # 是「内容高度变了」最准的信号（内层高度是我们自己设的，不会因此收到事件），
+        # 所以在这里挂一次重新校准。见 _settle 的注释。
         hint = tk.Frame(root, bg=P["card"])
         hint.pack(fill="x", pady=(ui.SPACE["sm"], 0))
         mk(hint, "", small=True)
-        tk.Label(hint, textvariable=self.var_period_hint, bg=P["card"],
-                 fg=P["text3"], font=ui.FONTS["small"]).pack(side="left")
-        tk.Label(hint, textvariable=self.var_holiday_hint, bg=P["card"],
-                 fg=P["text3"], font=ui.FONTS["small"]).pack(side="right")
+        self._hint_period = tk.Label(hint, textvariable=self.var_period_hint,
+                                     bg=P["card"], fg=P["text3"],
+                                     font=ui.FONTS["small"])
+        self._hint_period.pack(side="left")
+        self._hint_holiday = tk.Label(hint, textvariable=self.var_holiday_hint,
+                                      bg=P["card"], fg=P["text3"],
+                                      font=ui.FONTS["small"])
+        self._hint_holiday.pack(side="right")
+        for _lab in (self._hint_period, self._hint_holiday):
+            _lab.bind("<Configure>", lambda e: self._settle(2), add="+")
         return card
 
     # ------------------------------------------------------------------ 下半部分
@@ -783,6 +812,8 @@ class App(tk.Tk):
             button("选择文件…", self._pick_holiday_file)
             button("导出模板", self._export_holiday_template)
         self._refresh_holiday_hint()
+        # 这一排控件换过之后，配置卡高度变了，内层高度要跟着重新校（见 _settle）
+        self._settle()
 
     def _on_hol_src(self):
         self._build_holiday_controls()
