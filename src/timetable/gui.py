@@ -86,6 +86,9 @@ class App(tk.Tk):
         # 换学校不用改代码，选一个版式（或用 --layout 载入 JSON 配置）就行。
         self.layout = lay_mod.REGISTRY.get(lay_mod.DEFAULT_LAYOUT_ID)
         self.hol_fetched = None          # 联网取到的 YearHolidays（None=还没取）
+        # 当前记录是否来自 OCR。OCR 是"识别"出来的，必须在预览表里一眼看出来，
+        # 否则用户会把识别结果当成确定的解析结果直接生成。
+        self._from_ocr = False
         self.period_times = presets.get_preset(None, self.layout)
         self.holiday_file = None
         self.headless = False          # True 时弹窗只写日志，便于自动化测试
@@ -507,6 +510,9 @@ class App(tk.Tk):
             self.tree.column(c, width=ui.px(self._col_w[c]), anchor="w",
                              minwidth=ui.px(self._col_min[c]), stretch=False)
         self.tree.tag_configure("odd", background=P["row_alt"])
+        # 来源/可信度标注（配色要淡，不能盖住内容，只做"一眼能扫出来"）
+        self.tree.tag_configure("ocr", background="#FFF8E1")     # 淡黄：OCR 识别
+        self.tree.tag_configure("unsure", background="#FFEBEE")  # 淡红：时刻没对上节次
 
         vs = ttk.Scrollbar(grid, orient="vertical", command=self.tree.yview,
                            style="Modern.Vertical.TScrollbar")
@@ -1095,6 +1101,7 @@ class App(tk.Tk):
             from .xlsx_source import XlsxError, is_table_file, read_any
             from .ocr_source import OcrError, is_image_file, pdf_has_text_layer
             from .ocr_source import read_any_ocr
+            self._from_ocr = False       # 每次解析前复位，避免上一次的 OCR 标记残留
             if is_table_file(pdf):
                 self.log("输入类型：Excel/CSV（直接读单元格，不经过 PDF 版面解析）")
                 self.result = read_any(pdf)
@@ -1103,6 +1110,7 @@ class App(tk.Tk):
                          % ("图片" if is_image_file(pdf) else "无文字层的 PDF"))
                 self._set_status("正在识别图片…", "info")
                 self.update_idletasks()
+                self._from_ocr = True
                 self.result = read_any_ocr(pdf, layout=self.layout,
                                            period_times=self.period_times,
                                            log=self.log)
@@ -1144,8 +1152,12 @@ class App(tk.Tk):
             for c in chk["conflicts"][:8]:
                 self.log("   第%d周%s 第%d节：%s / %s" % c)
         else:
-            self._set_status("解析完成 · %d 条 · %d 次课"
-                             % (chk["records"], chk["instances"]), "ok")
+            if self._from_ocr:
+                self._set_status("识别完成 · %d 条（来自图像识别，请核对）"
+                                 % chk["records"], "warn")
+            else:
+                self._set_status("解析完成 · %d 条 · %d 次课"
+                                 % (chk["records"], chk["instances"]), "ok")
         for w in self.result.warnings:
             self.log("⚠ " + w)
         for n in getattr(self.result, "notes", []):
@@ -1164,8 +1176,18 @@ class App(tk.Tk):
     def _refresh_table(self):
         self.tree.delete(*self.tree.get_children())
         for i, r in enumerate(self.records):
+            tags = ["odd"] if i % 2 else []
+            # 来源标注：OCR 出来的行要一眼能认出来（整行淡黄底 + 状态栏提示），
+            # 因为这些行是"识别"出来的，最需要人工核对；PDF/Excel 的行是确定的。
+            if self._from_ocr:
+                tags.append("ocr")
+            elif not r.has_periods() and r.clock:
+                tags.append("unsure")      # 时刻没反查出节次
             self.tree.insert("", "end", iid=str(i), values=self._row_values(r),
-                             tags=("odd",) if i % 2 else ())
+                             tags=tuple(tags))
+        if self._from_ocr and self.records:
+            self.log("⚠ 这些课程来自图像识别，请逐行核对其中的课程名/教室/教师；"
+                     "改完可以「导出结果核对…」存成 Excel 再反复调。")
 
     def _row_values(self, r: Record):
         pt = self.period_times
