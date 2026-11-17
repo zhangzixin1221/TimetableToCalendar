@@ -138,9 +138,38 @@ _MULTI_TEACHER = re.compile(r"^[\u4e00-\u9fff·]{2,4}(?:[/／、,，][\u4e00-\u9
 # 这些词尾说明「这段是地点，不是人名」
 _NOT_A_NAME_TAIL = re.compile(r"(号楼|楼|室|馆|场|厅|区|中心|基地|堂|园|号|层|校区)$")
 
+# 纯汉字教室 + 教师粘连（`教东报告厅何平`）
+_GLUED_CJK_ROOM_TEACHER = re.compile(
+    r"^(?P<room>.*(?:楼|室|馆|场|厅|区|中心|基地|堂|园|号|层))"
+    r"(?P<teacher>[\u4e00-\u9fff·]{2,4}(?:[/／、,，][\u4e00-\u9fff·]{2,4})*)$")
+
 
 def _looks_like_room(tok: str) -> bool:
     return bool(re.search(r"[0-9A-Za-z]", tok)) or bool(_PLACE_TAIL.search(tok))
+
+
+def _split_glued(whole: str, squeeze) -> Optional[Tuple[str, str]]:
+    """把「教室+教师粘在一起、中间没有空格」的一段拆开；拆不出来返回 None。
+
+    两种形态：
+      1. 教室含数字/字母：`040401钱渝`、`2号楼2020104*郭文梅`、`4号楼2040401钱渝`
+         —— 教师段之前的字符必须是数字/字母/星号；
+      2. 教室是**纯汉字地点**：`教东报告厅何平`、`翱翔体育馆张伟`
+         —— 教室段以「楼/室/馆/场/厅/区/中心/基地」等地点词收尾。
+
+    两条都带同一个否定条件：教师段不能是地点词（否则 `1号楼` 会被拆成
+    教室=1、教师=号楼）。宁可拆不出来（教师并进教室名，用户能在预览表看到），
+    也不要把地点词当人名（那是"张冠李戴"，更误导）。
+    """
+    m = _GLUED_ROOM_TEACHER.match(whole)
+    if m and _MULTI_TEACHER.match(m.group("teacher")) \
+            and not _NOT_A_NAME_TAIL.search(m.group("teacher")):
+        return squeeze(m.group("room")), squeeze(m.group("teacher"))
+    m2 = _GLUED_CJK_ROOM_TEACHER.match(whole)
+    if m2 and _MULTI_TEACHER.match(m2.group("teacher")) \
+            and not _NOT_A_NAME_TAIL.search(m2.group("teacher")):
+        return squeeze(m2.group("room")), squeeze(m2.group("teacher"))
+    return None
 
 
 def _space_tail_auto(rest: str, squeeze) -> Tuple[str, str]:
@@ -166,10 +195,9 @@ def _space_tail_auto(rest: str, squeeze) -> Tuple[str, str]:
     else:
         whole = rest.strip()
     if whole:
-        mg = _GLUED_ROOM_TEACHER.match(whole)
-        if mg and _MULTI_TEACHER.match(mg.group("teacher")) \
-                and not _NOT_A_NAME_TAIL.search(mg.group("teacher")):
-            return squeeze(mg.group("room")), squeeze(mg.group("teacher"))
+        glued = _split_glued(whole, squeeze)
+        if glued:
+            return glued
     if len(parts) == 1:
         return squeeze(parts[0]), ""
     last, prev = parts[-1], parts[-2]
@@ -179,6 +207,12 @@ def _space_tail_auto(rest: str, squeeze) -> Tuple[str, str]:
     if (not _looks_like_room(last)) and re.fullmatch(r"[\u4e00-\u9fff·]{2,4}", last) \
             and any(_looks_like_room(p) for p in parts[:-1]):
         return squeeze(" ".join(parts[:-1])), squeeze(last)
+    # 最后一段自己就是「教室+教师」粘在一起（前面还有别的地点段，OCR 常把
+    # `实验大楼 C座5楼向礼琴` 认成两段）：把最后一段拆开，剩下的并入教室。
+    glued = _split_glued(last, squeeze)
+    if glued:
+        prefix = [p for p in parts[:-1] if not _SCHEDULE_NOISE.match(p)]
+        return squeeze(" ".join(prefix + [glued[0]])), squeeze(glued[1])
     return squeeze(rest), ""
 
 
@@ -267,9 +301,11 @@ class Layout:
     })
     term_re: str = r"(?P<a>\d{4})\s*[-–—~至]\s*(?P<b>\d{4})\s*(?P<season>[秋冬春夏])"
     credits_re: str = r"总学分\s*[:：]?\s*(?P<v>[\d.]+)"
-    # 打印日期：`2026/08/25`、`2026-08-25`、`2026.08.25` 都见过，一起收下
-    # （只认斜杠的话，连字符日期会只抓到 "2026"）
-    print_date_re: str = r"打印日期\s*[:：]?\s*(?P<v>[\d/\-.]+)"
+    # 打印日期：`2026/08/25`、`2026-08-25`、`2026.08.25` 都见过，一起收下。
+    # **必须是完整日期形状**：以前写成 `[\d/\-.]+`，遇到被拼在一起的页码会吃成
+    # `2026/08/251/2`（实测把 print_date 弄错）。
+    print_date_re: str = (r"打印日期\s*[:：]?\s*"
+                          r"(?P<v>\d{4}[/\-.]\d{1,2}[/\-.]\d{1,2})")
     remark_re: str = (r"(?P<no>\d+)\s*[.、]\s*(?P<name>[^\d.、]+?)\s+"
                       r"(?P<code>[A-Za-z]{2,}\d+[.\d]*)\s*\((?P<a>\d+)\s*~\s*(?P<b>\d+)\)")
     remark_head_re: str = r"备注\s*[:：](.{0,400})"

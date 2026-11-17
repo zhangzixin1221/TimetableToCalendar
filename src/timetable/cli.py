@@ -205,6 +205,7 @@ def main(argv=None) -> int:
 
     # ---- Excel / CSV 输入：不走 PDF 解析，直接读单元格 ----
     from .xlsx_source import XlsxError, is_table_file, read_any
+    from .ocr_source import OcrError, is_image_file, pdf_has_text_layer
     is_table = is_table_file(args.pdf)
 
     # ---- 结构转储（写版式用的工具，不生成 ics）----
@@ -244,6 +245,14 @@ def main(argv=None) -> int:
         if is_table:
             result = read_any(args.pdf)
             log("输入类型：Excel/CSV（直接读单元格，不经过 PDF 版面解析）")
+        elif is_image_file(args.pdf) or not pdf_has_text_layer(args.pdf):
+            # 图片 / 扫描件 / 字体子集缺失的 PDF：先 OCR 成「带坐标的文本」，
+            # 再交给同一套解析器（结构推断逻辑不分叉）。
+            from .ocr_source import read_any_ocr
+            log("输入类型：%s → 走 OCR（识别结果请在预览表里核对）"
+                % ("图片" if is_image_file(args.pdf) else "无文字层的 PDF"))
+            result = read_any_ocr(args.pdf, layout=lay, period_times=period_times,
+                                  log=log)
         else:
             if args.auto_layout:
                 lay, _ = detect_layout(args.pdf, log=log,
@@ -252,6 +261,9 @@ def main(argv=None) -> int:
                                period_times=period_times)
     except XlsxError as exc:
         print("Excel 有问题：%s" % exc, file=sys.stderr)
+        return 2
+    except OcrError as exc:
+        print("OCR 失败：%s" % exc, file=sys.stderr)
         return 2
     except Exception as exc:                        # noqa: BLE001
         print("解析失败：%s" % exc, file=sys.stderr)

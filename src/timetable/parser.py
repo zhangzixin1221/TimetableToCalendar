@@ -267,35 +267,31 @@ def _group_into_lines(items, tol: float) -> List[dict]:
 
 
 # --------------------------------------------------------------------- parsing
-def parse_pdf(pdf_path: str, log=None, layout: Optional[Layout] = None,
-              period_times: Optional[Dict[int, Tuple[str, str]]] = None,
-              clock_tolerance_min: int = 10) -> ParseResult:
-    """解析课表 PDF。
+def parse_spans_pages(pages, layout: Optional[Layout] = None, log=None,
+                      period_times: Optional[Dict[int, Tuple[str, str]]] = None,
+                      clock_tolerance_min: int = 10) -> ParseResult:
+    """从**每页的 span 列表**解析课表（与输入是 PDF 还是 OCR 无关）。
 
-    `layout`      不传就用默认的通用版式。
-    `period_times` 用户设定的作息表（节次 -> 上下课时间）。只用于一件事：
-                  把「格子里只印了时刻」的课**反查**成第几节。节次时间以用户设定为准，
-                  PDF 上的时刻只是线索。不传就跳过反查（这类课会进 warnings）。
+    这是「三段式」输入的关键一环：PDF 文字层、OCR（图片/扫描件）最终都变成
+    「带坐标的文本」，然后走**同一个**解析器。好处是只有一套结构推断逻辑要维护、
+    一套测试能覆盖两条路；坏处（如果分叉）就是今天已经踩过的坑 —— 两个入口各自
+    演化，其中一个悄悄解析出 0 条。
+
+    pages: [[span, ...], ...]，每页一组。span 至少要有 x0/y0/x1/y1/size/text，
+           有 base（基线）更好；没有就用 y0 代替。
     """
     def say(msg):
         if log:
             log(msg)
 
     lay = layout or REGISTRY.get(DEFAULT_LAYOUT_ID)
-    try:
-        import pymupdf
-    except ImportError as exc:
-        raise RuntimeError("缺少依赖 PyMuPDF，请先执行：pip install pymupdf") from exc
-
     rx = lay.compiled()
-    doc = pymupdf.open(pdf_path)
     result = ParseResult(layout_id=lay.id)
-    if doc.page_count > 1:
-        result.notes.append("PDF 共 %d 页，将逐页解析并合并。" % doc.page_count)
+    if len(pages) > 1:
+        result.notes.append("共 %d 页，将逐页解析并合并。" % len(pages))
 
-    for pno in range(doc.page_count):
-        page = doc[pno]
-        spans = _collect_spans(page)
+    for pno, spans in enumerate(pages):
+        spans = _with_base(spans)
         if not spans:
             continue
         if lay.entry_mode == "table":
@@ -304,12 +300,12 @@ def parse_pdf(pdf_path: str, log=None, layout: Optional[Layout] = None,
             recs = _parse_grid_page(spans, lay, rx, result, pno, result.warnings)
         result.records.extend(recs)
         if pno == 0:
-            result.meta = _parse_meta(page, lay, rx)
+            result.meta = _parse_meta(_spans_text(spans), lay, rx)
 
     if not result.records:
         raise RuntimeError(
             "版式「%s」没有解析到任何课程。\n"
-            "如果这份 PDF 是别的学校/别的打印入口导出的，换一种版式试试：--layout %s\n"
+            "如果这份课表是别的学校/别的打印入口导出的，换一种版式试试：--layout %s\n"
             "（先用 --dump-layout 看看程序眼里的这一页长什么样，再决定是选内置版式还是写一份。）"
             % (lay.name, "、".join(k for k in REGISTRY.ids() if k != lay.id)))
 
@@ -341,8 +337,74 @@ def parse_pdf(pdf_path: str, log=None, layout: Optional[Layout] = None,
     return result
 
 
+def parse_pdf(pdf_path: str, log=None, layout: Optional[Layout] = None,
+              period_times: Optional[Dict[int, Tuple[str, str]]] = None,
+              clock_tolerance_min: int = 10) -> ParseResult:
+    """解析课表 PDF（必须有文字层）。
+
+    `layout`      不传就用默认的通用版式。
+    `period_times` 用户设定的作息表（节次 -> 上下课时间）。只用于一件事：
+                  把「格子里只印了时刻」的课**反查**成第几节。节次时间以用户设定为准，
+                  PDF 上的时刻只是线索。不传就跳过反查（这类课会进 warnings）。
+
+    没有文字层的 PDF／图片请走 ocr_source（它渲染成图 → OCR → 同样交给
+    parse_spans_pages），两条路共用同一套结构解析。
+    """
+    def say(msg):
+        if log:
+            log(msg)
+
+    try:
+        import pymupdf
+    except ImportError as exc:
+        raise RuntimeError("缺少依赖 PyMuPDF，请先执行：pip install pymupdf") from exc
+
+    doc = pymupdf.open(pdf_path)
+    pages = [_collect_spans(doc[pno]) for pno in range(doc.page_count)]
+    doc.close()
+    return parse_spans_pages(pages, layout=layout, log=log,
+                             period_times=period_times,
+                             clock_tolerance_min=clock_tolerance_min)
+
+
+def _with_base(spans) -> list:
+    """保证每个 span 都有 base（基线）；外部来源（如 OCR）可能只给了 bbox。"""
+    out = []
+    for s in spans:
+        if "base" not in s:
+            s = dict(s)
+            s["base"] = s["y0"]
+        out.append(s)
+    return out
+
+
+def _spans_text(spans) -> str:
+    """把一页的 span 还原成纯文本（逐行拼接），用于抓「学期/姓名/学号」这类元信息。
+
+    PDF 可以直接 page.get_text()，但 OCR 来源没有那个接口。统一从 span 还原，
+    两条路就都能抓元信息（OCR 的元信息准确率同样受验收环节保护）。
+
+    注意要丢掉**页码**（`1/2` 这种）：它和"打印日期"常常在同一基线上，
+    不丢会被拼成 `打印日期： 2026/08/251/2`，把日期吃成 `2026/08/251/2`
+    （实测就是这样把 meta.print_date 弄错的）。
+    """
+    by_base: Dict[float, List[dict]] = {}
+    for s in spans:
+        t = (s.get("text") or "").strip()
+        if re.fullmatch(r"\d{1,3}\s*/\s*\d{1,3}", t):
+            continue                                  # 页码
+        key = round(s.get("base", s["y0"]), 1)
+        by_base.setdefault(key, []).append(s)
+    lines = []
+    for base in sorted(by_base):
+        row = sorted(by_base[base], key=lambda z: z["x0"])
+        lines.append("".join(z["text"] for z in row))
+    return "\n".join(lines)
+
+
 def _parse_grid_page(spans, lay: Layout, rx: dict, result: ParseResult,
                      pno: int, warnings: List[str]) -> List[Record]:
+    """解析「网格」型页面（block / inline 模式）。"""
     centres, header_bottom = _find_header(spans, lay)
     if centres is None:
         if pno == 0:
@@ -863,17 +925,51 @@ def _dedupe(records: List[Record]) -> List[Record]:
     return list(merged.values())
 
 
-def _parse_meta(page, lay: Layout, rx: dict) -> Meta:
+def _plausible(value: str, own_label: str = "", other_labels=()) -> str:
+    """元信息的合理性校验：不像「一个字段值」就丢掉。
+
+    为什么要这一步：OCR 之后文字常常粘成一长串（实测「学期 计算机学院 星期二星期三
+    星期四星期五」），而 grab() 只是取「标签后的第一个非空白串」，会把整串垃圾当成
+    学期/学院塞进日历名。宁可留空（日历名退化成「课表」），也不要显示一串错的。
+
+    注意**不能**简单按关键字排除：「计算机学院」是「学院：」的合法取值，虽然它含有
+    「学院」二字。所以只排除「看起来是**别的**字段的标签」的情形。
+    """
+    v = (value or "").strip()
+    if not v:
+        return ""
+    if len(v) > 24:                      # 一个字段值不该这么长
+        return ""
+    if ":" in v or "：" in v:            # 粘进了下一个「标签：」
+        return ""
+    if "星期" in v:                      # 粘进了表头
+        return ""
+    for lab in other_labels:
+        core = lab.rstrip("：: ")
+        if not core or core == own_label.rstrip("：: "):
+            continue
+        if core and core in v:           # 值里出现了别的字段名 -> 说明粘串了
+            return ""
+    return v
+
+
+def _parse_meta(text: str, lay: Layout, rx: dict) -> Meta:
+    """从**纯文本**里抓元信息（学期/姓名/学号…）。
+
+    收文本而不是收 page：PDF 与 OCR 两条路都要抓元信息，而 OCR 没有 page.get_text()。
+    统一由 _spans_text() 从 span 还原一行行文字，两边就一致了。
+    """
     meta = Meta()
-    text = page.get_text()          # 保留空格，否则字段会连成一片
+    text = text or ""
 
-    def grab(label):
+    def grab(label, own=""):
         m = re.search(re.escape(label) + r"\s*([^\s]+)", text)
-        return m.group(1) if m else ""
+        return _plausible(m.group(1), own, labels) if m else ""
 
+    labels = tuple((lay.meta_labels or {}).values())
     for field_name, label in (lay.meta_labels or {}).items():
         if hasattr(meta, field_name):
-            setattr(meta, field_name, grab(label))
+            setattr(meta, field_name, grab(label, label))
 
     m = rx["term_re"].search(text) if rx["term_re"] else None
     if m:

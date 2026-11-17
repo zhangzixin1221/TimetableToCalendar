@@ -727,11 +727,12 @@ class App(tk.Tk):
     # ------------------------------------------------------------------ 选文件
     def _pick_pdf(self):
         p = filedialog.askopenfilename(
-            title="选择课表文件（PDF，或 Excel/CSV 表格）",
-            filetypes=[("课表文件", "*.pdf *.xlsx *.xlsm *.csv"),
+            title="选择课表文件（PDF / Excel / 图片）",
+            filetypes=[("课表文件", "*.pdf *.xlsx *.xlsm *.csv *.png *.jpg *.jpeg"),
                        ("PDF 文件", "*.pdf"),
                        ("Excel 表格", "*.xlsx *.xlsm"),
                        ("CSV 表格", "*.csv"),
+                       ("课表图片（走 OCR）", "*.png *.jpg *.jpeg *.bmp *.webp"),
                        ("所有文件", "*.*")], parent=self)
         if p:
             self.load_pdf(p)
@@ -1092,9 +1093,19 @@ class App(tk.Tk):
         self._set_status("正在解析…", "info")
         try:
             from .xlsx_source import XlsxError, is_table_file, read_any
+            from .ocr_source import OcrError, is_image_file, pdf_has_text_layer
+            from .ocr_source import read_any_ocr
             if is_table_file(pdf):
                 self.log("输入类型：Excel/CSV（直接读单元格，不经过 PDF 版面解析）")
                 self.result = read_any(pdf)
+            elif is_image_file(pdf) or not pdf_has_text_layer(pdf):
+                self.log("输入类型：%s → 走 OCR（请核对识别结果）"
+                         % ("图片" if is_image_file(pdf) else "无文字层的 PDF"))
+                self._set_status("正在识别图片…", "info")
+                self.update_idletasks()
+                self.result = read_any_ocr(pdf, layout=self.layout,
+                                           period_times=self.period_times,
+                                           log=self.log)
             else:
                 if self.var_auto_layout.get():
                     from .parser import detect_layout
@@ -1109,6 +1120,11 @@ class App(tk.Tk):
             self.log("Excel 有问题：%s" % exc)
             self._set_status("Excel 有问题", "err")
             self._error("Excel 有问题", str(exc))
+            return False
+        except OcrError as exc:
+            self.log("OCR 失败：%s" % exc)
+            self._set_status("OCR 失败", "err")
+            self._error("OCR 失败", str(exc))
             return False
         except Exception as exc:                       # noqa: BLE001
             self.log("解析失败：%s" % exc)
