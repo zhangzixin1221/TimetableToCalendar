@@ -1,0 +1,13 @@
+# OCR 相关依赖（可选）
+#
+# 装了它，程序就能读「图片 / 扫描件 / 没有文字层的 PDF」课表（识别结果需要人工核对）。
+# 不装也能用：PDF（有文字层）与 Excel/CSV 输入不受任何影响，图片输入会提示装这两个。
+#
+# 体积代价：RapidOCR 含模型约 13MB，onnxruntime 约 25~40MB
+#          ⇒ Windows 安装包大约 +50MB。
+# 隐私：本地推理，课表（含姓名/学号）不会上传到任何服务器。
+#
+# 安装：
+#   pip install -r src/requirements-ocr.txt
+rapidocr-onnxruntime>=1.3
+onnxruntime>=1.16

@@ -29,10 +29,22 @@ if (-not (Test-Path "$SrcDir\main.py")) {
     exit 1
 }
 
+# 打进去的可选组件：
+#   openpyxl         Excel 课表（模板/导入/导出核对）
+#   rapidocr + onnxruntime  OCR（图片 / 无文字层的 PDF）
+# 两者装了就一起打包；没装也能构建，只是对应功能会在运行时给出"缺依赖"提示。
+#
+# 注意两件事（都实测过）：
+#   1. **不能 exclude numpy**：onnxruntime 依赖 numpy，排掉它 OCR 一跑就崩
+#      （以前这里 exclude 了 numpy，那时还没有 OCR）。
+#   2. RapidOCR 的模型是**数据文件**（.onnx），不在 .py 里，必须 --collect-data
+#      显式收集，否则打出来的包里没有模型、OCR 直接报错。
 python -m PyInstaller --noconfirm --onedir --windowed --clean `
   --name TimetableToCalendar `
   --exclude-module icalendar --exclude-module recurring_ical_events `
-  --exclude-module matplotlib --exclude-module numpy `
+  --exclude-module matplotlib `
+  --collect-data rapidocr_onnxruntime `
+  --collect-all onnxruntime `
   --distpath $OutDir --workpath "$PSScriptRoot\build" --specpath $PSScriptRoot `
   "$SrcDir\main.py"
 

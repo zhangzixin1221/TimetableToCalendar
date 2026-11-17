@@ -346,6 +346,7 @@ PDF 里的文字是「版面还原」出来的，绝大多数情况没问题，�
 
 ```powershell
 pip install -r src\requirements.txt
+pip install -r src\requirements-ocr.txt   # 可选：想读图片/扫描件课表才需要（约 +50MB）
 python src\main.py                 # 图形界面
 python src\main.py --cli -h        # 命令行
 ```
@@ -356,7 +357,7 @@ python src\main.py --cli -h        # 命令行
 不依赖 Inno Setup / NSIS 之类的打包工具。
 
 ```powershell
-pip install -r src\requirements.txt pyinstaller
+pip install -r src\requirements.txt -r src\requirements-ocr.txt pyinstaller
 powershell -ExecutionPolicy Bypass -File build_onedir.ps1             # → dist\TimetableToCalendar\
 powershell -ExecutionPolicy Bypass -File build_installer.ps1 -Clean   # → dist\TimetableToCalendar-Setup.exe
 ```
