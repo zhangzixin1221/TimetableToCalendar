@@ -1,16 +1,22 @@
 # 课表 PDF → 手机日历（.ics）
 
-把**西北工业大学教务系统**导出的《学生课表》PDF，转成可以直接导入 iPhone / iPad / Mac /
+把**教务系统导出的《学生课表》PDF**，转成可以直接导入 iPhone / iPad / Mac /
 Android 日历的 `.ics` 文件，并自动加上两类提醒：
 
 1. **每节课提前 N 分钟提醒**（默认 20 分钟）
 2. **每晚固定时间汇总第二天要上的所有课**（默认 22:00）
 
-还会按**法定节假日**停课（用 iCalendar 的 `EXDATE` 从循环里精确剔除），并处理**调休**。
+还会按**法定节假日**停课（用 iCalendar 的 `EXDATE` 从循环里精确剔除），并处理**调休**
+（节假日安排可以**联网按年份自动获取**，也可以自己填）。
 
-> Turn a NWPU (Northwestern Polytechnical University) course-timetable PDF into an
-> `.ics` calendar with per-class reminders, a nightly "tomorrow's classes" summary,
-> Chinese public-holiday handling, and a one-file Windows installer.
+内置一套**西北工业大学**的课表版式（开箱即用）；别的学校/别的教务系统靠
+「版式」适配 —— 不用改代码，选一个版式或写一份 JSON 配置即可，见
+[换学校 / 换教务系统](#换学校--换教务系统版式)。
+
+> Turn a course-timetable PDF (NWPU out of the box, other schools via a pluggable
+> *layout*) into an `.ics` calendar with per-class reminders, a nightly
+> "tomorrow's classes" summary, Chinese public-holiday handling — online or manual —
+> and a one-file Windows installer.
 
 界面是中文的，程序跑起来不需要 Python。
 
@@ -60,6 +66,16 @@ TimetableToCalendar.exe --cli 课表.pdf --alarm 15 --night 21:30   # 提前 15 
 TimetableToCalendar.exe --cli 课表.pdf --alarm 0 --night off       # 完全不要提醒
 TimetableToCalendar.exe --cli 课表.pdf --merge artifact            # 相连节次合并策略
 TimetableToCalendar.exe --cli 课表.pdf --remark-courses            # 备注课程也加为全天日程
+
+# 节假日联网获取（按学期自动推年份），并落成一份可手改的文件
+TimetableToCalendar.exe --cli 课表.pdf --fetch-holidays --save-holidays 节假日.txt
+TimetableToCalendar.exe --cli 课表.pdf --fetch-holidays 2026,2027 --holidays-refresh
+
+# 换学校 / 换教务系统
+TimetableToCalendar.exe --cli 课表.pdf --auto-layout               # 自动挑版式
+TimetableToCalendar.exe --cli 课表.pdf --list-layouts              # 有哪些内置版式
+TimetableToCalendar.exe --cli 课表.pdf --dump-layout               # 看程序眼里的版面结构
+TimetableToCalendar.exe --cli --layout-template                    # 导出版式配置模板
 ```
 
 `--cli -h` 可以看到全部参数。从源码跑就把 `TimetableToCalendar.exe` 换成
@@ -67,9 +83,53 @@ TimetableToCalendar.exe --cli 课表.pdf --remark-courses            # 备注课
 
 ---
 
+## 换学校 / 换教务系统（版式）
+
+「版式（layout）」= 一所学校课表 PDF 的**排版约定**：星期表头叫什么、周次写成
+`(1~16周)` 还是 `1-16周`、节次怎么标、教室和教师谁在前、这门校作息几点打铃。
+这些全部抽成了配置，不再写死在代码里。
+
+内置三种版式：
+
+| id | 适用 | 说明 |
+|---|---|---|
+| `nwpu`（默认） | 西工大教务《学生课表》 | 七列星期 + 格子里「标题行 + `(N周)(N-M节) 教室 教师`」，自带长安/友谊校区作息 |
+| `inline-grid` | 网格式，但每行自带课程名 | 例如一行写成 `高等数学 1-16周 1-2节 张伟 教三-101` |
+| `flat-table` | 平面表，一行一条课 | 有 `课程名称/教师/星期/节次/周次/上课地点` 这类列名的列表式导出（正方、强智常见） |
+
+### 三步适配你自己的学校
+
+1. **先让程序把 PDF 摊开给你看**：`--dump-layout`（界面里是「看结构」按钮）。
+   输出会逐行标明每行被判成*标题行 / 详情行 / 说明行 / 续行*，以及教室教师被切成了什么：
+
+   ```
+   y=  90.1  详情行    (1~16周)(1-2节) 教西D-101 陈明远
+            周次 1~16  节次 1-2  →  教室='教西D-101' 教师='陈明远'  剩余=''
+   ```
+
+2. **试内置版式**：`--auto-layout` 会挨个版式试解析并打印各自成绩（课程条数、读出
+   教室的条数、时间冲突数），挑一个最好的。也可以直接 `--layout flat-table` 指定。
+
+3. **内置的都不像，就写一份配置**：`--layout-template` 导出 `my-school-layout.json`
+   模板，照着第 1 步的输出改三条正则（`weeks_re` / `period_re` / `title_re`，要写
+   `(?P<a>…)` 这种具名分组），然后 `--layout my-school-layout.json` 用（界面里点
+   「载入配置…」）。字段名**写错会当场报错**，不会悄悄退回默认值骗你生成一份错日历。
+
+版式配置里还能带：`period_presets`（贵校作息表，这样下拉框就不再是西工大的节次）、
+`room_teacher`（教室/教师的切法：教师在前还是在末、是否用「教师：/教室：」标签）、
+`meta_labels`（`姓名：`/`学号：` 这些标签在你学校叫什么）、`semester_hint`（学期起点，
+换版式时拿来预填「第 1 周周一」）。
+
+> **诚实说明**：`nwpu` 是按真实导出格式反复验证过的；`inline-grid` / `flat-table`
+> 是按常见教务导出**格式**实现并用合成 PDF 验证的，没有拿某一所具体学校的真件验过。
+> 你的学校解析不对时，`--dump-layout` 是唯一可靠的诊断入口 —— 欢迎把改好的 JSON 提上来。
+
+---
+
 ## 必须自己确认的几个点
 
-程序只能从 PDF 里读到「第几周」，**读不到绝对日期**，也读不到上下课时间。所以：
+程序只能从 PDF 里读到「第几周」，**读不到绝对日期**。上下课时间则优先用 PDF 上印的
+时刻，PDF 没印才用作息表推。所以：
 
 ### 1. 第 1 周周一是哪天（最重要）
 
@@ -83,7 +143,7 @@ TimetableToCalendar.exe --cli 课表.pdf --remark-courses            # 备注课
 
 ### 2. 作息时间
 
-界面里可以选预设：
+界面里的下拉框列的是**当前版式自带的**预设。西工大版式带这三套：
 
 | 预设 | 说明 |
 |---|---|
@@ -91,8 +151,12 @@ TimetableToCalendar.exe --cli 课表.pdf --remark-courses            # 备注课
 | 西北工业大学 · 友谊校区（冬季 10.1-4.30） | 每节 50 分钟，只有 1~12 节 |
 | 西北工业大学 · 友谊校区（夏季 5.1-9.30） | 同上，下午与晚上整体后移 |
 
-对不上就点「编辑节次时间…」手动改。如果某节课用到的节次没设时间，程序会明确报错
+对不上就点「编辑节次时间…」手动改（改完若恰好与某套预设一致，下拉框会自动跳回那套
+的名字，不会一直显示「自定义」）。如果某节课用到的节次没设时间，程序会明确报错
 告诉你缺哪一节，而不是悄悄算错。
+
+换成了别的版式而它没有自带作息（`inline-grid` / `flat-table` 就没有），程序会直接说
+「还没有任何作息时间」并告诉你怎么填 —— 这一步必须人来定，代码不猜。
 
 ### 3. 相连节次要不要合并
 
@@ -109,14 +173,33 @@ TimetableToCalendar.exe --cli 课表.pdf --remark-courses            # 备注课
 
 ### 4. 法定节假日与调休
 
-界面里默认勾选「按法定节假日安排停课」。内置预设是国务院《关于 2026 年部分节假日安排
-的通知》里与 2026 秋季学期相关的部分（中秋节 09-25~27、国庆节 10-01~07 停课；
-09-20、10-10 调休）。换成别的学期就点「载入节假日文件…」，或者直接改
-`src/timetable/holidays.py` 里的预设。
+界面里默认勾选「按法定节假日安排停课」，来源三选一（选哪个就**只用**哪个，避免
+"以为在用联网数据、其实还在用内置预设"）：
+
+| 来源 | 怎么用 | 适用 |
+|---|---|---|
+| **内置预设** | 默认。国务院 2026 年安排里与 2026 秋季学期相关的部分（中秋 09-25~27、国庆 10-01~07 停课；09-20、10-10 调休） | 就是 2026 秋 |
+| **联网获取** | 界面「节假日数据 → 联网获取…」/ `--fetch-holidays`（年份留空就按「第 1 周周一 + 总周次」自动推该跨哪几个自然年） | 任意学期，含元旦等跨年假期 |
+| **节假日文件** | 界面「选择文件…」/ `--holidays-file`（纯文本，格式见下） | 学校自己调课、或干脆不想联网 |
+
+联网取到的是**缓存**的：内存 → 磁盘（`%LOCALAPPDATA%\TimetableToCalendar\holidays`）
+→ 主源 → 备源，全失败才报错，并且会把"试了哪些地址、为什么失败、下一步怎么办"写清楚
+（未来的年份会专门提示"国务院通知一般 11 月初才发布"）。想强制重取加 `--holidays-refresh`，
+换内网镜像加 `--holidays-url 'https://…/{year}.json'`（支持 `file:///`）。
+
+> 联网数据源是 [NateScarlet/holiday-cn](https://github.com/NateScarlet/holiday-cn)
+> （按国务院办公厅通知整理，JSON 里带原文链接可溯源）。程序只在**你点「联网获取」时**
+> 才出网，其它时刻一律离线；节假日数据本身不会自动更新。
+
+**建议把联网结果落成文件再改**：`--fetch-holidays --save-holidays 节假日.txt`（界面里对应
+「另存为节假日文件」）。学校自己的调课安排常与国务院口径不同，改这份文本比记着每次联网
+更省事，以后用 `--holidays-file 节假日.txt` 指它即可。
 
 调休日为什么通常不需要补课：高校通行做法是调休日照常执行「当天星期几」的课表，而不是去补
-别的星期的课。如果你学校是要「补某一天的课」，把 `makeup_days` 里的条目写成带
-`follow_weekday`（0=周一 … 6=周日），程序会自动在那天补上对应星期的课。
+别的星期的课 —— 这种情况下那些课本就在循环日程里，程序**不会**再额外加一遍（真加了就会
+出现同一时刻两条一模一样的课）。如果你的学校是"周六补周一的课"，把 `makeup_days` 里的条目
+写成带 `follow_weekday`（0=周一 … 6=周日），或节假日文件里写 `调休 2027-04-25 周一`，
+程序才会在那天补上对应星期的课。
 
 放假不是把日程删掉，而是用 `EXDATE` 从循环里精确剔除那几天——日程数不变，但那几天不会
 再有课、也不会再提醒。另外会在放假前一天晚上多发一条「明天放假」的提醒，并把当晚原定
@@ -144,9 +227,9 @@ PDF 里的文字是「版面还原」出来的，绝大多数情况没问题，�
 | 要改的 | 在哪改 | 怎么确认 |
 |---|---|---|
 | **第 1 周周一** | 界面顶部「第 1 周周一」/ `--week1` | 看校历上「X月X日 20XX级本科生开课」那一行 |
-| **本学期节假日安排** | 界面「载入节假日文件…」/ `--holidays-file` | 看当年国务院通知 + 学校教务处调课通知 |
+| **本学期节假日安排** | 界面「节假日数据 → 联网获取…」/ `--fetch-holidays`（最省事），或「选择文件…」/ `--holidays-file` | 联网的就是当年国务院通知；再对照学校教务处调课通知 |
 
-节假日文件是纯文本，格式很直白（界面里有「导出模板…」按钮可以直接生成）：
+节假日文件是纯文本，格式很直白（界面里有「导出模板」按钮可以直接生成）：
 
 ```
 放假 2027-04-04 2027-04-06 清明节
@@ -164,7 +247,8 @@ PDF 里的文字是「版面还原」出来的，绝大多数情况没问题，�
 - 第 1 周周一不是周一 → 报错
 - **填的日期推出来的学期和 PDF 里写的学期对不上** → 报错（专治「下学期忘了改日期」）
 - **节假日预设全部落在本学期范围之外** → 报错（专治「沿用了上学期的节假日」）
-- 课程用到的节次没设时间 → 报错
+- 课程用到的节次没设时间 → 报错（版式没自带作息时会直接说「还没有任何作息时间」）
+- 自动识别出的版式**读不出教室**或仍有时间冲突 → 明确警告，不静默采用
 
 报错时命令行会中止（退出码 3，加 `--force` 可强制生成），界面上会弹窗让你决定。
 
@@ -172,14 +256,22 @@ PDF 里的文字是「版面还原」出来的，绝大多数情况没问题，�
 
 ## 适用范围与已知限制
 
-- **只认西工大教务系统的《学生课表》版式**（七列表头 + 左侧节次栏 + 「(N周)(N-M节) 教室 教师」）。
-  换学校 / 换教务系统就不认，程序会**明确报错退出**（「没有找到星期一…星期日表头」
-  或「没有解析到任何课程」），不会硬猜出一个错误结果。
+- **默认只保证西工大教务系统的《学生课表》版式**（七列表头 + 左侧节次栏 +
+  「(N周)(N-M节) 教室 教师」）。其它学校靠**版式**适配：先试 `--auto-layout`，
+  不像就照 `--dump-layout` 的输出写一份 JSON（见
+  [换学校 / 换教务系统](#换学校--换教务系统版式)）。版式都不匹配时程序会
+  **明确报错退出**（「没有找到星期一…星期日表头」或「没有解析到任何课程」），
+  不会硬猜出一个错误结果。
+- **`inline-grid` / `flat-table` 两个内置版式没有真实学校 PDF 验过**，只按常见教务导出
+  格式实现并用合成 PDF 做了回归。它们更像"起步模板"而不是"某校开箱即用"。
 - **单双周**：PDF 里的「2~4(双)周」会被正确展开成第 2、4 周。程序不是一个无限循环加例外，
   而是按连续区间拆成若干条日程，保证每条都能精确表达。
 - **相连节次合并后是一条长日程**（例如周一 08:30-12:10），中间不会留出课间空档。
-- **不联网**，节假日安排要自己按当年国务院通知填写，不会自动获取。
-- **教室和教师靠空格分隔识别**，个别行可能识别错，用预览表改一次即可。
+- **默认离线**：只有你点「联网获取…」/ 加 `--fetch-holidays` 时才出网取节假日，
+  且取一次就缓存；除此之外不联网、不自动更新任何东西。
+- **教室和教师靠空格分隔识别**，个别行可能识别错，用预览表改一次即可
+  （`--dump-layout` 能直接看到每一行被切成了什么）。
+- 自动识别版式是**猜**的：它会把每个版式的成绩打给你看，请务必扫一眼再用。
 
 ---
 
@@ -213,8 +305,14 @@ powershell -ExecutionPolicy Bypass -File build_installer.ps1 -Clean   # → dist
 ```powershell
 pip install -r src\requirements-dev.txt
 
+# 没有真实课表？先合成一份假的（个人课表不进仓库，但回归必须能跑）
+python tools\make_fixture.py --check        # 生成 fixtures\nwpu-sample.pdf 并断言解析正确
+python tools\make_fixture_alt.py --check    # inline-grid / flat-table 两种版式
+
 python src\selftest.py  <你的课表.pdf>    # 端到端：解析 → 生成 → 用第三方库独立展开核对
 python src\smoke_test.py <你的课表.pdf>   # 界面烟雾测试（驱动界面逻辑走完整流程）
+python tools\test_holiday_fetch.py        # 联网节假日：合并/跨年/缓存/文本往返/错误分支
+python tools\test_layout.py               # 版式层：切分策略、周次归一、JSON 校验、自动识别
 python tools\resize_test.py               # 窗口缩放回归（含极小窗口）
 python tools\resize_wm_test.py            # 窗口缩放回归（走窗口管理器，模拟拖边框）
 python tools\table_fit_test.py <课表.pdf>  # 预览表列宽自适应（左右缩放不许裁掉右边的列）
@@ -231,18 +329,9 @@ dist\TimetableToCalendar-Setup.exe --pathcheck path.txt # 安装位置规范化�
 - 对三种合并模式各生成一份 `.ics`，检查 CRLF、无超过 75 字节的行、标签配对
 - **用 `recurring-ical-events` 独立展开所有循环日程**，把每晚那条汇总的内容与第二天
   实际展开出来的课程**逐条比对**（防止「提醒内容和实际课程对不上」）
-- 检查同一天展开出的课程互不重叠
+- 检查同一天展开出的课程互不重叠（这条抓到了调休日重复排课的 bug，见 开发说明.md）
 - 检查法定节假日当天确实没有课，且每个假期都有一条「明天放假」提醒
 - 换学期场景：故意填错日期 / 沿用旧节假日，确认自检能报出对应错误
-
-打包好的 exe 也能自检：
-
-```powershell
-TimetableToCalendar.exe --selftest 你的课表.pdf out.ics report.txt
-```
-
-报告里会写明 DPI、Pillow 圆角渲染、默认窗口尺寸、滚动条状态 —— 这些是程序化确认界面
-真的按预期工作（Pillow 没打进包时会静默退回直角，必须靠这个发现）。
 
 ---
 
@@ -252,20 +341,24 @@ TimetableToCalendar.exe --selftest 你的课表.pdf out.ics report.txt
 ├── src/                       应用源码
 │   ├── main.py                入口（无参数=界面，--cli=命令行，--selftest=自检，--shot=截图）
 │   ├── timetable/
-│   │   ├── parser.py          PDF → 结构化课程记录
+│   │   ├── layout.py          ★ 课表「版式」定义：表头/正则/切分策略/作息，可 JSON 外部载入
+│   │   ├── parser.py          PDF → 结构化课程记录（按版式走；含 detect_layout 自动识别）
+│   │   ├── debug_dump.py      ★ --dump-layout：把程序眼里的版面结构摊开（写版式靠它）
 │   │   ├── ics.py             课程记录 → .ics（两套提醒、连排合并、节假日 EXDATE）
 │   │   ├── holidays.py        法定节假日 / 调休预设 + 外部节假日文件解析
+│   │   ├── holiday_fetch.py   ★ 联网按年份取节假日（holiday-cn，带缓存与降级链）
 │   │   ├── doctor.py          配置自检（专抓「换学期忘改参数」）
-│   │   ├── presets.py         作息时间预设
+│   │   ├── presets.py         作息时间预设（随版式走）
 │   │   ├── ui_kit.py          界面组件库（圆角控件 + 配色 + DPI 适配）
 │   │   ├── gui.py             tkinter 界面
 │   │   └── cli.py             命令行
 │   ├── selftest.py            端到端自检
 │   └── smoke_test.py          界面烟雾测试
+├── fixtures/                  合成课表 PDF 与产物（个人课表一律不进仓库）
 ├── installer-src/             安装器源码（C#，用系统自带 csc.exe 编译）
 │   ├── Installer.cs
 │   └── Uninstaller.cs
-├── tools/                     开发用的回归脚本（缩放 / 圆角 / 截图分析）
+├── tools/                     开发用的回归脚本（合成 fixture / 缩放 / 圆角 / 截图分析）
 ├── assets/                    随包附带的用户说明（构建时复制进产物）
 ├── 7z-extra/x64/7za.exe       官方 7-Zip 独立解压内核（构建安装包时需要）
 ├── build_onedir.ps1           构建应用本体

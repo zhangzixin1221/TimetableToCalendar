@@ -21,13 +21,16 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import doctor
 from . import holidays as hol_mod
+from . import layout as lay_mod
 from . import presets
 from . import ui_kit as ui
 from .ics import Config, IcsError, build_ics, sanity_check_ics
+from .layout import LayoutError
 from .parser import (WEEKDAY_SHORT, ParseResult, Record, Segment, compress_weeks,
                      expand_weeks, parse_pdf, verify_parse)
 
 MERGE_SEGMENTS = [("相连就合并", "all"), ("只合并碎片", "artifact"), ("不合并", "none")]
+HOL_SEGMENTS = [("内置预设", "preset"), ("联网获取", "fetch"), ("节假日文件", "file")]
 
 P = ui.PALETTE
 
@@ -80,14 +83,20 @@ class App(tk.Tk):
 
         self.result: ParseResult | None = None
         self.records: list[Record] = []
-        self.period_times = presets.get_preset(presets.DEFAULT_PRESET)
+        # 版式：决定「这份 PDF 长什么样」——表头叫什么、周次节次怎么写、自带哪几套作息。
+        # 换学校不用改代码，选一个版式（或用 --layout 载入 JSON 配置）就行。
+        self.layout = lay_mod.REGISTRY.get(lay_mod.DEFAULT_LAYOUT_ID)
+        self.hol_fetched = None          # 联网取到的 YearHolidays（None=还没取）
+        self.period_times = presets.get_preset(None, self.layout)
         self.holiday_file = None
         self.headless = False          # True 时弹窗只写日志，便于自动化测试
 
         self.var_pdf = tk.StringVar()
         self.var_out = tk.StringVar()
         self.var_week1 = tk.StringVar(value="2026-08-31")
-        self.var_preset = tk.StringVar(value=presets.DEFAULT_PRESET)
+        self.var_layout = tk.StringVar(value=self.layout.id)
+        self.var_auto_layout = tk.BooleanVar(value=False)
+        self.var_preset = tk.StringVar(value=presets.default_preset_name(self.layout))
         self.var_period_hint = tk.StringVar()
         self.var_alarm_on = tk.BooleanVar(value=True)
         self.var_alarm_min = tk.StringVar(value="20")
@@ -97,6 +106,8 @@ class App(tk.Tk):
         self.var_merge = tk.StringVar(value="all")
         self.var_holiday = tk.BooleanVar(value=True)
         self.var_holiday_notice = tk.BooleanVar(value=True)
+        self.var_hol_src = tk.StringVar(value="preset")      # preset | fetch | file
+        self.var_hol_years = tk.StringVar(value="")          # 空 = 按学期自动推年份
         self.var_holiday_hint = tk.StringVar()
         self.var_footer = tk.StringVar(value="选择课表 PDF，然后点右下角「解析课表」。")
         self._log_lines = 5      # 日志行数，屏幕太矮时自动让位给预览表
@@ -304,9 +315,11 @@ class App(tk.Tk):
         cell(0, 2, "作息时间")
         w = box(0, 3)
         cb = ui.RoundedInput(w, textvariable=self.var_preset, kind="combo",
-                             values=list(presets.PRESETS), width=ui.px(300))
+                             values=presets.preset_names(self.layout),
+                             width=ui.px(300))
         cb.pack(side="left")
         cb.widget.bind("<<ComboboxSelected>>", lambda e: self._on_preset())
+        self._preset_combo = cb
         ui.RoundedButton(w, text="节次时间…", kind="ghost", height=ui.px(32),
                          command=self._edit_periods).pack(side="left",
                                                           padx=(ui.SPACE["sm"], 0))
@@ -341,11 +354,28 @@ class App(tk.Tk):
                   command=self._refresh_holiday_hint).pack(side="left")
         ui.Switch(w, text="放假前一晚提醒", variable=self.var_holiday_notice).pack(
             side="left", padx=(ui.SPACE["md"], 0))
-        ui.RoundedButton(w, text="载入文件…", kind="ghost", height=ui.px(32),
-                         command=self._pick_holiday_file).pack(side="left",
-                                                               padx=(ui.SPACE["md"], 0))
-        ui.RoundedButton(w, text="导出模板", kind="ghost", height=ui.px(32),
-                         command=self._export_holiday_template).pack(
+        ui.Segmented(w, HOL_SEGMENTS, variable=self.var_hol_src,
+                     command=self._on_hol_src).pack(side="left",
+                                                    padx=(ui.SPACE["md"], 0))
+
+        # 行 3：节假日数据来源 ｜ 课表版式（换学校改这里，不用碰代码）
+        cell(3, 0, "节假日数据")
+        self._hol_box = box(3, 1)
+        self._build_holiday_controls()
+
+        cell(3, 2, "课表版式")
+        w = box(3, 3)
+        cb2 = ui.RoundedInput(w, textvariable=self.var_layout, kind="combo",
+                              values=lay_mod.REGISTRY.ids(), width=ui.px(110))
+        cb2.pack(side="left")
+        cb2.widget.bind("<<ComboboxSelected>>", lambda e: self._on_layout())
+        self._layout_combo = cb2
+        for _txt, _cmd in (("载入配置…", self._pick_layout_file),
+                           ("版式模板", self._export_layout_template),
+                           ("看结构", self._dump_layout)):
+            ui.RoundedButton(w, text=_txt, kind="ghost", height=ui.px(32),
+                             command=_cmd).pack(side="left", padx=(ui.SPACE["xs"], 0))
+        ui.Switch(w, text="自动识别", variable=self.var_auto_layout).pack(
             side="left", padx=(ui.SPACE["sm"], 0))
 
         # ---- 提示行 ----
@@ -587,9 +617,13 @@ class App(tk.Tk):
     def _refresh_period_hint(self):
         # 不能把 13 个节次全列出来：那样这行会宽到 1200px，把整张卡片撑爆
         times = self.period_times
-        first = times.get(1, ("?", "?"))
-        self.var_period_hint.set("第 1 节 %s-%s … 共 %d 节"
-                                 % (first[0], first[1], len(times)))
+        if not times:
+            self.var_period_hint.set("本版式没有自带作息表 —— 点「节次时间…」逐节填写"
+                                     "（课表 PDF 上印了上下课时刻的课程会自动直接用 PDF 的）")
+            return
+        shown = presets.describe(times, max_items=3)
+        self.var_period_hint.set("%s%s" % (shown, " … 共 %d 节" % len(times)
+                                           if len(times) > 3 else ""))
 
     def _refresh_holiday_hint(self):
         def short(hs, ms):
@@ -598,7 +632,14 @@ class App(tk.Tk):
             m = "、".join("%d/%d" % (x.date.month, x.date.day) for x in ms)
             return "节假日：%s%s" % (h or "无", ("（调休 %s）" % m) if m else "")
 
-        if self.holiday_file:
+        if not self.var_holiday.get():
+            self.var_holiday_hint.set("未处理节假日（放假期间也会排课）")
+            return
+        src = self.var_hol_src.get()
+        if src == "file":
+            if not self.holiday_file:
+                self.var_holiday_hint.set("节假日：还没选文件")
+                return
             try:
                 hs, ms = hol_mod.load_holiday_file(self.holiday_file)
                 self.var_holiday_hint.set("%s ｜ %s" % (
@@ -606,21 +647,37 @@ class App(tk.Tk):
             except hol_mod.HolidayFileError as exc:
                 self.var_holiday_hint.set("节假日文件有问题：%s" % exc)
             return
-        if self.var_holiday.get():
-            self.var_holiday_hint.set(short(hol_mod.DEFAULT_HOLIDAYS,
-                                            hol_mod.DEFAULT_MAKEUP_DAYS))
-        else:
-            self.var_holiday_hint.set("未处理节假日（放假期间也会排课）")
+        if src == "fetch":
+            if not self.hol_fetched:
+                self.var_holiday_hint.set("节假日：还没联网获取（点右边「联网获取…」）")
+                return
+            yh = self.hol_fetched
+            self.var_holiday_hint.set("%s ｜ %s年%s"
+                                      % (short(yh.holidays, yh.makeup_days),
+                                         "、".join(str(y) for y in yh.years),
+                                         "（缓存）" if yh.from_cache else ""))
+            return
+        self.var_holiday_hint.set(short(hol_mod.DEFAULT_HOLIDAYS,
+                                        hol_mod.DEFAULT_MAKEUP_DAYS))
 
     def _holidays_for_config(self):
-        if self.holiday_file:
+        src = self.var_hol_src.get() if self.var_holiday.get() else "off"
+        if src == "off":
+            return [], []
+        if src == "file":
+            if not self.holiday_file:
+                raise IcsError("节假日来源选了「节假日文件」，但还没选文件。"
+                               "请点「选择文件…」，或把来源改回内置预设。")
             return hol_mod.load_holiday_file(self.holiday_file)
-        if self.var_holiday.get():
-            return list(hol_mod.DEFAULT_HOLIDAYS), list(hol_mod.DEFAULT_MAKEUP_DAYS)
-        return [], []
+        if src == "fetch":
+            if not self.hol_fetched:
+                raise IcsError("节假日来源选了「联网获取」，但还没取过数据。"
+                               "请先点「联网获取…」（要联网，失败会说明原因）。")
+            return list(self.hol_fetched.holidays), list(self.hol_fetched.makeup_days)
+        return list(hol_mod.DEFAULT_HOLIDAYS), list(hol_mod.DEFAULT_MAKEUP_DAYS)
 
     def _on_preset(self):
-        self.period_times = presets.get_preset(self.var_preset.get())
+        self.period_times = presets.get_preset(self.var_preset.get(), self.layout)
         self._refresh_period_hint()
 
     # ------------------------------------------------------------------ 选文件
@@ -661,7 +718,8 @@ class App(tk.Tk):
             self._warn("提示", "这个文件里没有任何「放假」或「调休」行。")
             return
         self.holiday_file = p
-        self._refresh_holiday_hint()
+        self.var_hol_src.set("file")
+        self._build_holiday_controls()
         self.log("已载入节假日文件：%s" % p)
         for h in hs:
             self.log("    " + h.label())
@@ -682,8 +740,244 @@ class App(tk.Tk):
             self._error("写文件失败", str(exc))
             return
         self.log("已导出模板：%s" % p)
-        self.log("下学期照着改这个文件，再用「载入节假日文件…」选它即可。")
+        self.log("下学期照着改这个文件，再用「节假日数据 → 选择文件…」选它即可。")
         self._info("完成", "模板已导出：\n%s\n\n下学期改这个文件即可，不必动代码。" % p)
+
+    # ------------------------------------------------------------ 节假日数据来源
+    def _build_holiday_controls(self):
+        """按「内置预设 / 联网获取 / 节假日文件」三种来源换一排控件。
+
+        为什么做成三选一而不是几个按钮并排：并排的话用户会不知道当前到底在用哪份
+        节假日数据，而「以为在用联网数据、其实还在用上学期的内置预设」正是本项目
+        最警惕的静默错误。选中的来源直接决定这一排显示什么，所见即所用。
+        """
+        for c in self._hol_box.winfo_children():
+            c.destroy()
+        box = self._hol_box
+        src = self.var_hol_src.get()
+
+        def label(text, small=True):
+            tk.Label(box, text=text, bg=P["card"],
+                     fg=P["text3"] if small else P["text2"],
+                     font=ui.FONTS["small"] if small else ui.FONTS["body"]
+                     ).pack(side="left")
+
+        def button(text, cmd, padx=ui.SPACE["xs"]):
+            ui.RoundedButton(box, text=text, kind="ghost", height=ui.px(32),
+                             command=cmd).pack(side="left", padx=(padx, 0))
+
+        if src == "preset":
+            label("内置：%s" % hol_mod.DEFAULT_PRESET)
+            button("换成节假日文件…", lambda: (self.var_hol_src.set("file"),
+                                               self._build_holiday_controls()))
+        elif src == "fetch":
+            tk.Label(box, text="年份", bg=P["card"], fg=P["text2"],
+                     font=ui.FONTS["body"]).pack(side="left")
+            ui.RoundedInput(box, textvariable=self.var_hol_years,
+                            width=ui.px(96)).pack(side="left", padx=(ui.SPACE["xs"], 0))
+            label("（空 = 按「第 1 周周一 + 周次」自动推）")
+            button("联网获取…", self._fetch_holidays)
+        else:
+            name = os.path.basename(self.holiday_file) if self.holiday_file else "未选择"
+            label("文件：%s" % name)
+            button("选择文件…", self._pick_holiday_file)
+            button("导出模板", self._export_holiday_template)
+        self._refresh_holiday_hint()
+
+    def _on_hol_src(self):
+        self._build_holiday_controls()
+
+    def _fetch_holidays(self):
+        """联网取法定节假日安排。取到就当作当前来源用；取不到**不会**退回内置预设。"""
+        from .holiday_fetch import HolidayFetchError, fetch_year, holidays_for_range
+
+        spec = (self.var_hol_years.get() or "").strip()
+        self.log("")
+        self._set_status("正在联网获取节假日…", "info")
+        self.update_idletasks()
+        try:
+            if not spec:
+                if not self.records:
+                    raise HolidayFetchError(
+                        "没有填年份，就得先「解析课表」，程序才知道这个学期跨了哪几个自然年。")
+                weeks = [w for r in self.records for w in r.all_weeks()]
+                max_week = max(weeks) if weeks else 19
+                try:
+                    w1 = dt.date.fromisoformat(self.var_week1.get().strip())
+                except ValueError:
+                    raise HolidayFetchError(
+                        "「第 1 周周一」要先填对（格式 2026-08-31），才知道去取哪几年的数据。")
+                yh = holidays_for_range(w1, w1 + dt.timedelta(weeks=max_week)
+                                        - dt.timedelta(days=1))
+                self.log("联网获取节假日：按学期 %s ~ %s 推到年份 %s"
+                         % (w1, w1 + dt.timedelta(weeks=max_week) - dt.timedelta(days=1),
+                            "、".join(str(y) for y in yh.years)))
+            else:
+                parts = [x.strip() for x in spec.replace("，", ",").split(",") if x.strip()]
+                if len(parts) == 1:
+                    yh = fetch_year(int(parts[0]))
+                else:
+                    ys = [int(x) for x in parts]
+                    yh = holidays_for_range(dt.date(ys[0], 1, 1), dt.date(ys[-1], 12, 31))
+        except ValueError:
+            self._set_status("年份格式不对", "err")
+            self._error("年份格式不对",
+                        "「年份」要么留空（自动推），要么写 2026，要么写 2026,2027。")
+            return False
+        except HolidayFetchError as exc:
+            # 这条信息本身就写清了「试了哪些地址、为什么失败、下一步怎么办」，
+            # 所以整段进日志，弹窗只挑第一行，别把用户淹死。
+            self.log(str(exc))
+            self._set_status("联网获取失败", "err")
+            self._error("联网获取节假日失败", str(exc).splitlines()[0] +
+                        "\n\n完整说明在日志区（含可操作的下一步）。")
+            return False
+        self.hol_fetched = yh
+        for line in yh.describe().splitlines():
+            self.log("    " + line)
+        if not yh.holidays:
+            self._warn("注意", "这份数据里一个放假安排都没有，等于没开节假日停课。")
+        self._set_status("已获取 %s 年节假日" % "、".join(str(y) for y in yh.years), "ok")
+        self._refresh_holiday_hint()
+        self._reveal_log()
+        return True
+
+    def _save_holidays_as_file(self):
+        """把联网结果落成可编辑的文本文件（学校自己调课时，改文件比等上游更新方便）。"""
+        if not self.hol_fetched:
+            self._info("提示", "还没有联网获取过节假日，先点「联网获取…」。")
+            return
+        from .holiday_fetch import to_holiday_file_text
+        p = filedialog.asksaveasfilename(
+            title="另存为节假日文件", defaultextension=".txt",
+            initialfile="节假日-%s.txt" % "、".join(str(y) for y in self.hol_fetched.years),
+            filetypes=[("文本文件", "*.txt")], parent=self)
+        if not p:
+            return
+        try:
+            with io.open(p, "w", encoding="utf-8") as f:
+                f.write(to_holiday_file_text(self.hol_fetched))
+        except OSError as exc:
+            self._error("写文件失败", str(exc))
+            return
+        self.holiday_file = p
+        self.var_hol_src.set("file")
+        self._build_holiday_controls()
+        self.log("已存成节假日文件（学校临时调课就改这份，再用「选择文件…」选它）：%s" % p)
+
+    # ------------------------------------------------------------------ 版式
+    def _apply_layout(self, lay, quiet=False):
+        """换版式：作息预设跟着换（每所学校节次不同），并提示要重新解析。"""
+        self.layout = lay
+        self.var_layout.set(lay.id)
+        names = presets.preset_names(lay)
+        try:
+            cb = self._layout_combo.widget
+            cb.configure(values=names)
+        except Exception:                             # noqa: BLE001
+            pass
+        try:
+            pcb = self._preset_combo.widget
+            pcb.configure(values=names)
+        except Exception:                             # noqa: BLE001
+            pass
+        self.var_preset.set(presets.default_preset_name(lay))
+        self.period_times = presets.get_preset(self.var_preset.get(), lay)
+        self._refresh_period_hint()
+        # 版式自带的学期起点拿来预填「第 1 周周一」：换学校时这个日期几乎肯定要变，
+        # 而填错正是本项目最怕的静默错误，所以宁可主动提示一句让用户核对。
+        hint = (lay.semester_hint or {}).get("week1_monday")
+        if hint and self.var_week1.get().strip() != hint:
+            self.var_week1.set(hint)
+            if not quiet:
+                self.log("    已按该版式把「第 1 周周一」预填成 %s，请对照校历确认。" % hint)
+        if not quiet:
+            self.log("课表版式：%s（%s）" % (lay.name, lay.entry_mode))
+            if lay.note:
+                self.log("    " + lay.note)
+            if not names:
+                self.log("    ⚠ 这个版式没有自带作息时间，请点「节次时间…」把每节课的"
+                         "上下课时间填上（若课表 PDF 上本来就印了时刻，程序会直接用）。")
+            if self.records:
+                self.log("    版式变了，请重新点「解析课表」。")
+
+    def _on_layout(self):
+        try:
+            lay = lay_mod.REGISTRY.get(self.var_layout.get())
+        except LayoutError as exc:
+            self._error("版式不存在", str(exc))
+            return
+        self._apply_layout(lay)
+
+    def _pick_layout_file(self):
+        p = filedialog.askopenfilename(
+            title="选择版式配置（JSON）", filetypes=[("版式配置", "*.json"),
+                                                     ("所有文件", "*.*")], parent=self)
+        if not p:
+            return
+        try:
+            lay = lay_mod.load_layout_file(p)
+            lay_mod.REGISTRY.add(lay, replace=True)
+        except LayoutError as exc:
+            self._error("版式配置有问题", str(exc))
+            self.log("⚠ 版式配置读不了：%s" % exc)
+            return
+        self._apply_layout(lay)
+        self.log("已载入版式配置：%s" % p)
+
+    def _export_layout_template(self):
+        p = filedialog.asksaveasfilename(
+            title="导出版式配置模板", defaultextension=".json",
+            initialfile="my-school-layout.json",
+            filetypes=[("版式配置", "*.json")], parent=self)
+        if not p:
+            return
+        try:
+            lay_mod.export_template(p)
+        except OSError as exc:
+            self._error("写文件失败", str(exc))
+            return
+        self.log("已导出版式模板：%s" % p)
+        self.log("下一步：选一个 PDF 点「看结构」，照着打印出来的行改 weeks_re / period_re。")
+        self._info("完成",
+                   "模板已导出：\n%s\n\n用法：\n"
+                   "1. 先点「看结构」看程序眼里的你学校 PDF 长什么样\n"
+                   "2. 改 weeks_re / period_re / title_re 三条正则（要写 (?P<a>…) 这种具名分组）\n"
+                   "3. 「载入配置…」选中它\n"
+                   "字段写错会当场报错，不会悄悄用默认值。" % p)
+
+    def _dump_layout(self):
+        pdf = self.var_pdf.get().strip()
+        if not pdf or not os.path.isfile(pdf):
+            self._warn("提示", "先选择课表 PDF，才能看结构。")
+            return
+        from .debug_dump import dump_pdf
+        try:
+            text = dump_pdf(pdf, self.layout)
+        except Exception as exc:                      # noqa: BLE001
+            self._error("读不了这个 PDF", str(exc))
+            return
+        out = os.path.splitext(pdf)[0] + "-结构.txt"
+        try:
+            with io.open(out, "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except OSError as exc:
+            out = os.path.join(os.environ.get("TEMP", "."), "timetable-结构.txt")
+            try:
+                with io.open(out, "w", encoding="utf-8") as f:
+                    f.write(text + "\n")
+            except OSError:
+                self._error("写文件失败", str(exc))
+                return
+        self.log("")
+        for line in text.splitlines()[:400]:
+            self.log(line)
+        self.log("结构已写入：%s" % out)
+        self._info("已导出结构",
+                   "程序眼里的这份 PDF 已写到：\n%s\n\n"
+                   "重点看每条「详情行」后面的「教室=… 教师=…」对不对，\n"
+                   "以及哪些行被判成了「续行?」/「说明行」——那就是要改正则的地方。" % out)
+        self._reveal_log()
 
     # ------------------------------------------------------------------ 解析
     def load_pdf(self, path: str):
@@ -705,7 +999,12 @@ class App(tk.Tk):
         self.log("=" * 56)
         self._set_status("正在解析…", "info")
         try:
-            self.result = parse_pdf(pdf, log=self.log)
+            if self.var_auto_layout.get():
+                from .parser import detect_layout
+                self.log("自动识别版式…")
+                lay, _notes = detect_layout(pdf, log=self.log)
+                self._apply_layout(lay, quiet=True)
+            self.result = parse_pdf(pdf, log=self.log, layout=self.layout)
         except Exception as exc:                       # noqa: BLE001
             self.log("解析失败：%s" % exc)
             self._set_status("解析失败", "err")
@@ -727,7 +1026,9 @@ class App(tk.Tk):
             self._set_status("解析完成 · %d 条 · %d 次课"
                              % (chk["records"], chk["instances"]), "ok")
         for w in self.result.warnings:
-            self.log("提示：" + w)
+            self.log("⚠ " + w)
+        for n in getattr(self.result, "notes", []):
+            self.log("提示：" + n)
         if md.remark_courses:
             self.log("备注中无固定时间的课程：%s"
                      % "、".join(c["name"] for c in md.remark_courses))
@@ -792,10 +1093,13 @@ class App(tk.Tk):
         self.wait_window(dlg)
         if dlg.saved:
             self.period_times = dlg.result_times()
-            self.var_preset.set("（自定义）")
+            # 手改完之后，如果恰好和某套预设完全一致，就显示那个预设名；否则才是「自定义」。
+            # 不这么做的话，用户把时间调回长安校区、下拉框却还写着「（自定义）」，误导。
+            matched = presets.find_preset_containing(self.period_times, self.layout)
+            self.var_preset.set(matched or "（自定义）")
             self._refresh_period_hint()
             self._refresh_table()
-            self.log("已更新节次时间。")
+            self.log("已更新节次时间。" + ("（与预设「%s」一致）" % matched if matched else ""))
 
     # ------------------------------------------------------------------ 生成
     def _build_config(self) -> Config:
@@ -840,6 +1144,7 @@ class App(tk.Tk):
             holidays=hol_list,
             makeup_days=makeup_list,
             holiday_notice=bool(self.var_holiday_notice.get()),
+            layout_id=self.layout.id,
         )
 
     def do_generate(self):

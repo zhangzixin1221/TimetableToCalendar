@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from .holidays import Holiday, MakeupDay
-from .parser import WEEKDAY_SHORT, Record, ParseResult, Segment, compress_weeks
+from .parser import WEEKDAY_SHORT, ParseResult, Record, compress_weeks
 
 
 # --------------------------------------------------------------------- config
@@ -43,6 +43,8 @@ class Config:
     makeup_days: List[MakeupDay] = field(default_factory=list)
     # 放假第一天前一晚，是否发一条「明天放假」的提醒
     holiday_notice: bool = True
+    # 只是给人看的溯源信息（写进日志/日历名旁边，不参与计算）
+    layout_id: str = ""
 
 
 class IcsError(Exception):
@@ -74,9 +76,24 @@ def fold(line: str) -> List[str]:
     return [out[0]] + [" " + p for p in out[1:]]
 
 
+_HHMM_RE = re.compile(r"^\s*(\d{1,2})\s*[:：]\s*(\d{1,2})\s*$")
+
+
 def _stamp(d: dt.date, hm: str) -> str:
-    h, mi = hm.split(":")
-    return "%04d%02d%02dT%s%s00" % (d.year, d.month, d.day, h, mi)
+    """日期 + "HH:MM" -> iCalendar 时间戳。
+
+    这里再校验一次是因为 `--period-times 1=8:30-9:15`（命令行）和界面「节次时间…」
+    都能把任意字符串直接塞进 period_times，绕过了版式文件那层的规范化。
+    不校验的话 `"8:30"` 会被拼成 `T83000` —— 一个畸形时间，日历端要么拒收、要么排到
+    别处，而程序自己毫不知情。宁可在这里明确报错。
+    """
+    m = _HHMM_RE.match(str(hm))
+    if not m:
+        raise IcsError("时间格式不对：%r（要写成 HH:MM，例如 08:30）" % (hm,))
+    h, mi = int(m.group(1)), int(m.group(2))
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        raise IcsError("时间不是合法时刻：%r" % (hm,))
+    return "%04d%02d%02dT%02d%02d00" % (d.year, d.month, d.day, h, mi)
 
 
 def _date_only(d: dt.date) -> str:
@@ -135,6 +152,14 @@ def merge_contiguous(records: List[Record], mode: str = "all") -> List[Record]:
                 for n in r.notes:
                     if n not in last.notes:
                         last.notes.append(n)
+                # 合并 PDF 自带的上下课时刻：两段都有就取外包区间；
+                # 只有一段有就别猜（拼出来的时刻没有依据），退回按节次查作息表，
+                # 真缺时间会由 _check_periods 明确报错，不会静默算错。
+                if last.clock and r.clock:
+                    last.clock = (min(last.clock[0], r.clock[0]),
+                                  max(last.clock[1], r.clock[1]))
+                elif last.clock or r.clock:
+                    last.clock = None
                 continue
             acc.append(r)
         merged_all.extend(acc)
@@ -143,12 +168,25 @@ def merge_contiguous(records: List[Record], mode: str = "all") -> List[Record]:
 
 
 def _check_periods(records: List[Record], period_times: Dict[int, Tuple[str, str]]):
-    missing = sorted({p for r in records for p in range(r.pfrom, r.pto + 1)
-                      if p not in period_times})
+    missing = sorted({p for r in records if not r.clock
+                      for p in range(r.pfrom, r.pto + 1) if p not in period_times})
     if missing:
         raise IcsError(
-            "节次 %s 没有设置上下课时间。请在「作息时间」里补全（可选用预设，或手动编辑）。"
+            "节次 %s 没有设置上下课时间。请在「作息时间」里补全（可选用预设，或手动编辑）；"
+            "命令行用 --period-times 1=08:30-09:15,2=09:25-10:10 指定。"
             % "、".join(str(m) for m in missing))
+
+
+def class_times(r: Record, period_times: Dict[int, Tuple[str, str]]) -> Tuple[str, str]:
+    """这门课几点上、几点下课。
+
+    版式直接把上下课时刻印在 PDF 上时（`Record.clock`）**以它为准** —— 那是原始数据，
+    比对着作息表按节次推算更可靠（走班课、一次连排 3 小时、临时调节课都可能不在作息表里）。
+    没有 clock 才回到节次时间表。
+    """
+    if r.clock:
+        return r.clock
+    return period_times[r.pfrom][0], period_times[r.pto][1]
 
 
 def build_grid(records: List[Record]) -> Dict[Tuple[int, int], List[Record]]:
@@ -163,13 +201,8 @@ def build_grid(records: List[Record]) -> Dict[Tuple[int, int], List[Record]]:
 
 
 # ----------------------------------------------------------------- 节假日处理
-def holiday_of(date: dt.date, holidays: List[Holiday]) -> Optional[Holiday]:
-    for h in holidays:
-        if h.start <= date <= h.end:
-            return h
-    return None
-
-
+# 注意这里没有「某一天属于哪个假期」的查询函数：全项目只用得到「这一天放不放假」，
+# 所以只有 _holiday_date_set 一个集合查询。（以前那个 holiday_of() 从没被调用过，删。）
 def _holiday_date_set(holidays: List[Holiday]):
     out = set()
     for h in holidays:
@@ -197,11 +230,19 @@ def build_day_map(records: List[Record], cfg: Config):
 
     makeup_added: List[Tuple[dt.date, Record, int]] = []
     for m in cfg.makeup_days:
-        wd = m.follow_weekday if m.follow_weekday is not None else m.date.weekday()
+        own = m.date.weekday()
+        wd = m.follow_weekday if m.follow_weekday is not None else own
         delta = (m.date - cfg.week1_monday).days
         if delta < 0:
             continue
         week = delta // 7 + 1
+        # 「按当天星期几执行」的调休日**不需要**往 day_map 里加课：
+        # 那天星期几的课本来就在 FREQ=WEEKLY 的循环里，日期正好就是这一天，再加一遍
+        # 就成了同一时刻两条一模一样的课（原真实课表周末没课所以一直没暴露；一旦学校
+        # 周末有课，节假日前一晚的「原定课程已取消」和夜间汇总都会重复列。
+        # 只有「周六补周一的课」这种 follow_weekday 与当天星期几不同的才要显式补进去。
+        if wd == own:
+            continue
         for r in records:
             if r.day != wd or week not in r.all_weeks():
                 continue
@@ -281,8 +322,7 @@ def build_ics(result: ParseResult, cfg: Config):
         if not weeks:
             continue
         wf = weeks[0]
-        s_hm = cfg.period_times[r.pfrom][0]
-        e_hm = cfg.period_times[r.pto][1]
+        s_hm, e_hm = class_times(r, cfg.period_times)
         first = cfg.week1_monday + dt.timedelta(weeks=wf - 1, days=r.day)
 
         desc = ["第%s周 ｜ %s 第%d-%d节 %s-%s" % (compress_weeks(weeks), r.day_name,
@@ -363,20 +403,20 @@ def build_ics(result: ParseResult, cfg: Config):
                 if same_day:
                     desc.append("原定课程已取消：")
                     for (cr, cw) in same_day:
-                        desc.append("  · %s %s-%s %s"
-                                    % (cr.course, cfg.period_times[cr.pfrom][0],
-                                       cfg.period_times[cr.pto][1], cr.room))
+                        cs, ce = class_times(cr, cfg.period_times)
+                        desc.append("  · %s %s-%s %s" % (cr.course, cs, ce, cr.room))
                 desc.append("祝假期愉快！")
                 summary = "明天放假（%s）" % h.name
                 # UID 统一用 night- 前缀：所有「晚间提醒」都是一类，便于外部工具识别
                 uid = "night-holiday-%s@nwpu.timetable" % h.start.isoformat()
             else:
                 classes = day_map[target]
-                items = ["%d. %s-%s %s ｜ %s%s"
-                         % (idx, cfg.period_times[r.pfrom][0],
-                            cfg.period_times[r.pto][1], r.course, r.room,
-                            ("｜" + r.teacher_for(w)) if r.teacher_for(w) else "")
-                         for idx, (r, w) in enumerate(classes, 1)]
+                items = []
+                for idx, (r, w) in enumerate(classes, 1):
+                    cs, ce = class_times(r, cfg.period_times)
+                    items.append("%d. %s-%s %s ｜ %s%s"
+                                 % (idx, cs, ce, r.course, r.room,
+                                    ("｜" + r.teacher_for(w)) if r.teacher_for(w) else ""))
                 desc = ["明天（%d月%d日 %s）共 %d 节课："
                         % (target.month, target.day, WEEKDAY_SHORT[target.weekday()],
                            len(classes))]

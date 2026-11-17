@@ -6,6 +6,17 @@
     python -m timetable.cli 课表.pdf -o 我的课表.ics --week1 2026-08-31 --preset 长安校区
     python -m timetable.cli 课表.pdf --alarm 15 --night 21:30 --remark-courses
     python -m timetable.cli 课表.pdf --alarm 0 --night off        # 不要提醒
+
+换学校 / 换教务系统：
+    python -m timetable.cli 课表.pdf --auto-layout          # 挨个版式试，挑最像的
+    python -m timetable.cli 课表.pdf --layout my.json       # 用自己写的版式文件
+    python -m timetable.cli --list-layouts                  # 看有哪些内置版式
+    python -m timetable.cli 课表.pdf --dump-layout          # 打印程序眼里的这一页
+
+节假日联网：
+    python -m timetable.cli 课表.pdf --fetch-holidays                  # 按学期自动推年份
+    python -m timetable.cli 课表.pdf --fetch-holidays 2026,2027        # 指定年份
+    python -m timetable.cli 课表.pdf --fetch-holidays --save-holidays 节假日.txt
 """
 from __future__ import annotations
 
@@ -17,9 +28,11 @@ import sys
 
 from . import doctor
 from . import holidays as hol_mod
+from . import layout as lay_mod
 from . import presets
 from .ics import Config, IcsError, build_ics, merge_contiguous, sanity_check_ics
-from .parser import WEEKDAY_SHORT, compress_weeks, parse_pdf, verify_parse
+from .parser import (WEEKDAY_SHORT, compress_weeks, detect_layout, parse_pdf,
+                     verify_parse)
 
 
 def _periods_from_arg(spec: str):
@@ -37,17 +50,18 @@ def _periods_from_arg(spec: str):
     return out
 
 
-def main(argv=None) -> int:
+def _make_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="timetable", description="把教务系统课表 PDF 转成可导入手机日历的 .ics")
-    ap.add_argument("pdf", help="课表 PDF 路径")
+    ap.add_argument("pdf", nargs="?", help="课表 PDF 路径")
     ap.add_argument("-o", "--out", help="输出 .ics 路径（默认与 PDF 同名）")
     ap.add_argument("--week1", default="2026-08-31",
                     help="第 1 周的周一日期，格式 YYYY-MM-DD（默认 2026-08-31）")
-    ap.add_argument("--preset", default=presets.DEFAULT_PRESET,
-                    choices=list(presets.PRESETS), help="作息时间预设")
+    ap.add_argument("--preset", default=None,
+                    help="作息时间预设；不填用所选版式的默认那套（--list-layouts 能看每套"
+                         "版式自带哪些预设）")
     ap.add_argument("--period-times", default=None,
-                    help="手动指定作息时间，如 1=08:30-09:15,2=09:25-10:10（会覆盖预设）")
+                    help="手动指定作息时间，如 1=08:30-09:15,2=09:25-10:10（覆盖预设）")
     ap.add_argument("--alarm", default="20",
                     help="每节课提前多少分钟提醒，0 表示关闭（默认 20）")
     ap.add_argument("--night", default="22:00",
@@ -58,22 +72,111 @@ def main(argv=None) -> int:
                     help="相连节次怎么合并：all=相连就合并（默认）；"
                          "artifact=只合并导出器拆出的碎片（如 11-12节+13-13节）；"
                          "none=完全按 PDF 的行")
-    ap.add_argument("--holidays", default="on",
-                    help="按法定节假日安排扣除停课并处理调休，on/off（默认 on）")
-    ap.add_argument("--holidays-file", default=None,
-                    help="本学期的节假日安排文件（纯文本，格式见 timetable/holidays.py 里的"
-                         " HOLIDAY_FILE_TEMPLATE）；指定后用它替代内置预设")
-    ap.add_argument("--force", action="store_true",
-                    help="即使配置自检发现错误也照常生成")
-    ap.add_argument("--no-holiday-notice", action="store_true",
-                    help="放假前一晚不发「明天放假」提醒")
-    ap.add_argument("--remark-courses", action="store_true",
-                    help="把备注中无固定时间的课程也加为全天日程")
+
+    g = ap.add_argument_group("版式（换学校 / 换教务系统）")
+    g.add_argument("--layout", default=lay_mod.DEFAULT_LAYOUT_ID,
+                   help="内置版式 id（%s），或一个版式 JSON 文件路径"
+                        % "、".join(lay_mod.REGISTRY.ids()))
+    g.add_argument("--auto-layout", action="store_true",
+                   help="挨个版式试解析，按「课程条数 − 冲突 − 警告」挑一个（会打印每个版式"
+                        "的成绩，务必核对再用）")
+    g.add_argument("--list-layouts", action="store_true",
+                   help="列出所有可用版式（含 --layout-dir 载入的）后退出")
+    g.add_argument("--layout-dir", default=None,
+                   help="从这个目录载入所有 *.json 版式（可与 --layout 搭配）")
+    g.add_argument("--layout-template", metavar="PATH", nargs="?", const="__DEFAULT__",
+                   default=None, help="导出一份版式配置模板（JSON）到 PATH，不填用"
+                                      " my-school-layout.json；给别的学校写版式就从这里开始")
+    g.add_argument("--dump-layout", action="store_true",
+                   help="不生成 .ics，只打印程序从 PDF 里看到的结构（列、行、每条正文行的"
+                        "切分结果），用来写/调版式")
+
+    h = ap.add_argument_group("节假日")
+    h.add_argument("--holidays", default="on",
+                   help="按法定节假日安排扣除停课并处理调休，on/off（默认 on）")
+    h.add_argument("--holidays-file", default=None,
+                   help="本学期的节假日安排文件（纯文本，格式见 timetable/holidays.py 里的"
+                        " HOLIDAY_FILE_TEMPLATE）；指定后用它替代内置预设")
+    h.add_argument("--fetch-holidays", nargs="?", const="auto", default=None,
+                   metavar="年份",
+                   help="联网获取法定节假日安排（数据源：holiday-cn，按国务院办公厅通知整理）。"
+                        "不填年份就按「第 1 周周一 + 总周次」自动推；也可写 2026,2027")
+    h.add_argument("--holidays-url", default=None,
+                   help="换数据源地址（要含 {year} 占位，支持 https:// 与 file:///，"
+                        "内网镜像/离线包用）")
+    h.add_argument("--holidays-refresh", action="store_true",
+                   help="忽略本地缓存，重新联网取节假日")
+    h.add_argument("--save-holidays", default=None, metavar="PATH",
+                   help="把这次用的节假日安排写成可编辑的纯文本文件（学校自己调课时，"
+                        "改这份文件比改代码方便）")
+    h.add_argument("--force", action="store_true",
+                   help="即使配置自检发现错误也照常生成")
+    h.add_argument("--no-holiday-notice", action="store_true",
+                   help="放假前一晚不发「明天放假」提醒")
+    h.add_argument("--remark-courses", action="store_true",
+                   help="把备注中无固定时间的课程也加为全天日程")
     ap.add_argument("--name", default=None, help="日历名称（默认按课表信息自动生成）")
     ap.add_argument("-q", "--quiet", action="store_true", help="只输出必要信息")
-    args = ap.parse_args(argv)
+    return ap
 
+
+def _resolve_layout(args, ap, log) -> lay_mod.Layout:
+    """把 --layout-dir / --layout / --auto-layout 收敛成一个版式对象。"""
+    if args.layout_dir:
+        if not os.path.isdir(args.layout_dir):
+            print("错误：--layout-dir 不是目录：%s" % args.layout_dir, file=sys.stderr)
+            raise SystemExit(2)
+        loaded = lay_mod.load_layout_dir(args.layout_dir)
+        if loaded:
+            log("已从 %s 载入版式：%s"
+                % (args.layout_dir, "、".join(x.id for x in loaded)))
+    key = (args.layout or "").strip()
+    if key.lower().endswith(".json") or os.path.isfile(key):
+        try:
+            return lay_mod.load_layout_file(key)
+        except lay_mod.LayoutError as exc:
+            print("错误：版式文件有问题：%s" % exc, file=sys.stderr)
+            raise SystemExit(2)
+    try:
+        return lay_mod.REGISTRY.get(key)
+    except lay_mod.LayoutError as exc:
+        print("错误：%s" % exc, file=sys.stderr)
+        raise SystemExit(2)
+
+
+def main(argv=None) -> int:
+    ap = _make_parser()
+    args = ap.parse_args(argv)
     log = (lambda m: None) if args.quiet else (lambda m: print(m))
+
+    # ---------- 不需要课表的操作 ----------
+    if args.list_layouts:
+        for lay in lay_mod.REGISTRY.all():
+            log("* %-12s %s" % (lay.id, lay.name))
+            log("             模式=%s  作息预设=%s"
+                % (lay.entry_mode, "、".join(lay.preset_names()) or "（无，要自己填）"))
+            if lay.note:
+                log("             %s" % lay.note)
+        log("")
+        log("自己学校的版式：--layout-template 导模板，改完 --layout 那个文件 用；"
+            "先看结构用 --dump-layout。")
+        return 0
+    if args.layout_template:
+        path = "my-school-layout.json" if args.layout_template == "__DEFAULT__" \
+            else args.layout_template
+        lay_mod.export_template(path)
+        print("已导出版式模板：%s" % path)
+        print("怎么改：先 `--dump-layout 你的课表.pdf` 看程序眼里的结构，"
+              "再照着 weeks_re / period_re / title_re 改；字段名写错会当场报错。")
+        return 0
+    if not args.pdf:
+        ap.print_usage(sys.stderr)
+        print("错误：要给定课表 PDF（只有 --list-layouts / --layout-template 可以不填）。",
+              file=sys.stderr)
+        return 2
+    if not os.path.isfile(args.pdf):
+        print("错误：找不到文件：%s" % args.pdf, file=sys.stderr)
+        return 2
 
     try:
         week1 = dt.date.fromisoformat(args.week1)
@@ -81,9 +184,64 @@ def main(argv=None) -> int:
         print("错误：--week1 需要 YYYY-MM-DD 格式，例如 2026-08-31", file=sys.stderr)
         return 2
 
-    period_times = presets.get_preset(args.preset)
+    # ---- 选版式 ----
+    lay = _resolve_layout(args, ap, log)
+
+    # ---- 结构转储（写版式用的工具，不生成 ics）----
+    if args.dump_layout:
+        from .debug_dump import dump_pdf
+        print(dump_pdf(args.pdf, lay))
+        return 0
+
+    # ---- 解析 ----
+    try:
+        if args.auto_layout:
+            lay, _ = detect_layout(args.pdf, log=log)
+        result = parse_pdf(args.pdf, log=log, layout=lay)
+    except Exception as exc:                        # noqa: BLE001
+        print("解析失败：%s" % exc, file=sys.stderr)
+        return 1
+
+    if week1.weekday() != 0:
+        print("提示：%s 不是周一，星期几会整体偏移，请确认。" % week1, file=sys.stderr)
+
+    md = result.meta
+    log("课表信息：%s  %s %s %s  学号 %s  姓名 %s"
+        % (md.term, md.grade, md.college, md.major, md.sid, md.name))
+    chk = verify_parse(result)
+    log("自检：%d 条记录、共 %d 次课、时间冲突 %d 处"
+        % (chk["records"], chk["instances"], len(chk["conflicts"])))
+    for c in chk["conflicts"][:5]:
+        print("  冲突：第%d周%s第%d节 %s / %s" % c, file=sys.stderr)
+    for w in result.warnings:
+        print("  ⚠ %s" % w, file=sys.stderr)
+    for n in result.notes:
+        log("提示：%s" % n)
+
+    merged = merge_contiguous(result.records, args.merge)
+    log("相连节次合并：%d 条记录 -> %d 个日程（模式 %s）"
+        % (len(result.records), len(merged), args.merge))
+    log("第 1 周周一 = %s，版式 = %s" % (week1, lay.name))
+
+    # ---- 作息 ----
+    names = presets.preset_names(lay)
+    preset_name = args.preset or presets.default_preset_name(lay)
+    if names and preset_name not in names and not args.period_times:
+        print("错误：版式「%s」没有叫「%s」的作息预设，可用：%s"
+              % (lay.name, preset_name, "、".join(names)), file=sys.stderr)
+        return 2
+    period_times = presets.get_preset(preset_name, lay) if names else {}
     if args.period_times:
-        period_times.update(_periods_from_arg(args.period_times))
+        try:
+            period_times.update(_periods_from_arg(args.period_times))
+        except ValueError as exc:
+            print("错误：%s" % exc, file=sys.stderr)
+            return 2
+    if args.period_times:
+        log("作息时间：%s（%s）" % (preset_name if names else "版式未自带",
+                                    "已用 --period-times 覆盖"))
+    elif names:
+        log("作息时间：%s" % preset_name)
 
     try:
         alarm = int(args.alarm)
@@ -104,48 +262,75 @@ def main(argv=None) -> int:
             print("错误：--night 需要 HH:MM 或 off", file=sys.stderr)
             return 2
 
-    # ---- 解析 ----
-    try:
-        result = parse_pdf(args.pdf, log=log)
-    except Exception as exc:                      # noqa: BLE001
-        print("解析失败：%s" % exc, file=sys.stderr)
-        return 1
-
-    if week1.weekday() != 0:
-        print("提示：%s 不是周一，星期几会整体偏移，请确认。" % week1, file=sys.stderr)
-
-    md = result.meta
-    log("课表信息：%s  %s %s %s  学号 %s  姓名 %s"
-        % (md.term, md.grade, md.college, md.major, md.sid, md.name))
-    chk = verify_parse(result)
-    log("自检：%d 条记录、共 %d 次课、时间冲突 %d 处"
-        % (chk["records"], chk["instances"], len(chk["conflicts"])))
-    for c in chk["conflicts"][:5]:
-        print("  冲突：第%d周%s第%d节 %s / %s" % c, file=sys.stderr)
-
-    merged = merge_contiguous(result.records, args.merge)
-    log("相连节次合并：%d 条记录 -> %d 个日程（模式 %s）"
-        % (len(result.records), len(merged), args.merge))
-    log("第 1 周周一 = %s，作息 = %s" % (week1, args.preset))
-
-    use_holidays = str(args.holidays).strip().lower() not in ("off", "no", "none", "关闭", "0")
-    holiday_list = hol_mod.DEFAULT_HOLIDAYS if use_holidays else []
-    makeup_list = hol_mod.DEFAULT_MAKEUP_DAYS if use_holidays else []
+    # ---- 节假日 ----
+    use_holidays = str(args.holidays).strip().lower() not in (
+        "off", "no", "none", "关闭", "0")
+    holiday_list = list(hol_mod.DEFAULT_HOLIDAYS) if use_holidays else []
+    makeup_list = list(hol_mod.DEFAULT_MAKEUP_DAYS) if use_holidays else []
+    holidays_src = "内置预设" if use_holidays else "未启用"
     if args.holidays_file:
         try:
             holiday_list, makeup_list = hol_mod.load_holiday_file(args.holidays_file)
         except hol_mod.HolidayFileError as exc:
             print("节假日文件有问题：%s" % exc, file=sys.stderr)
             return 2
+        holidays_src = "文件 %s" % os.path.basename(args.holidays_file)
         log("已读取节假日文件：%s" % args.holidays_file)
+    if args.fetch_holidays is not None:
+        from .holiday_fetch import HolidayFetchError, fetch_year, holidays_for_range
+        weeks = [w for r in result.records for w in r.all_weeks()]
+        max_week = max(weeks) if weeks else 19
+        spec = (args.fetch_holidays or "auto").strip()
+        try:
+            if spec.lower() in ("auto", "", "学期"):
+                span = (week1, week1 + dt.timedelta(weeks=max_week) - dt.timedelta(days=1))
+                yh = holidays_for_range(span[0], span[1],
+                                        url_template=args.holidays_url,
+                                        use_cache=not args.holidays_refresh)
+                log("联网获取节假日：按学期 %s ~ %s 推到年份 %s"
+                    % (span[0], span[1], "、".join(str(y) for y in yh.years)))
+            else:
+                parts = [p.strip() for p in spec.replace("，", ",").split(",") if p.strip()]
+                if len(parts) == 1:
+                    yh = fetch_year(int(parts[0]), url_template=args.holidays_url,
+                                    use_cache=not args.holidays_refresh)
+                else:
+                    years = [int(p) for p in parts]
+                    yh = holidays_for_range(dt.date(years[0], 1, 1),
+                                            dt.date(years[-1], 12, 31),
+                                            url_template=args.holidays_url,
+                                            use_cache=not args.holidays_refresh)
+                log("联网获取节假日：%s 年" % "、".join(str(y) for y in yh.years))
+        except ValueError:
+            print("错误：--fetch-holidays 要写年份（如 2026）或 2026,2027，或干脆不填值"
+                  "（按学期自动推）", file=sys.stderr)
+            return 2
+        except HolidayFetchError as exc:
+            print(str(exc), file=sys.stderr)
+            return 3
+        holiday_list, makeup_list = yh.holidays, yh.makeup_days
+        holidays_src = "联网（%s）" % "、".join(str(y) for y in yh.years)
+        for line in yh.describe().splitlines()[1:]:
+            log("    " + line)
+        if yh.from_cache and args.holidays_url:
+            # 缓存只按年份存，不记"这份数据是哪个镜像来的"。换了 --holidays-url 却命中
+            # 旧缓存的话，用户会以为新镜像生效了。明确说一句，并给出强制重取的办法。
+            log("    注意：这次用的是本地缓存，不是 %s 现取的数据。想让它真正生效，"
+                "加 --holidays-refresh 重新联网。" % args.holidays_url)
+        if args.save_holidays:
+            from .holiday_fetch import to_holiday_file_text
+            with io.open(args.save_holidays, "w", encoding="utf-8") as f:
+                f.write(to_holiday_file_text(yh))
+            log("已把这批节假日写成可编辑文件：%s（学校自己调课时改这份，"
+                "以后用 --holidays-file 指它）" % args.save_holidays)
+        use_holidays = True
 
     cfg = Config(
         week1_monday=week1,
         period_times=period_times,
         class_alarm_min=alarm if alarm > 0 else None,
         night_summary=night_on,
-        night_hour=nh,
-        night_minute=nm,
+        night_hour=nh, night_minute=nm,
         night_duration_min=args.night_duration,
         include_remark_courses=args.remark_courses,
         merge_mode=args.merge,
@@ -153,6 +338,7 @@ def main(argv=None) -> int:
         holidays=holiday_list,
         makeup_days=makeup_list,
         holiday_notice=not args.no_holiday_notice,
+        layout_id=lay.id,
     )
 
     # ---- 配置自检：专门抓「换学期忘了改参数」这类不会报错只会算错的问题 ----
@@ -168,8 +354,9 @@ def main(argv=None) -> int:
             if f.level == "error":
                 print("  " + str(f), file=sys.stderr)
         return 3
-    if use_holidays or args.holidays_file:
-        log("节假日：" + hol_mod.describe(holiday_list, makeup_list))
+    if use_holidays or args.holidays_file or args.fetch_holidays:
+        log("节假日（来源：%s）：" % holidays_src
+            + hol_mod.describe(holiday_list, makeup_list))
 
     try:
         text, stats = build_ics(result, cfg)

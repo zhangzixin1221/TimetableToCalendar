@@ -122,12 +122,15 @@ def diagnose(cfg: Config, result: ParseResult, n_weeks: int = None) -> List[Find
             "可用 --holidays-file 指定本学期的节假日安排。"))
 
     # ---- 4. 节次时间是否齐全 ----
-    missing = sorted({p for r in result.records for p in range(r.pfrom, r.pto + 1)
-                      if p not in cfg.period_times})
+    # PDF 自己印了上下课时刻的课程（Record.clock）不依赖作息表，跳过不查
+    missing = sorted({p for r in result.records if not r.clock
+                      for p in range(r.pfrom, r.pto + 1) if p not in cfg.period_times})
     if missing:
+        tip = ("在界面上点「编辑节次时间…」补全，或换一个作息预设。" if cfg.period_times
+               else "当前版式没有自带作息表：界面点「节次时间…」逐节填，"
+                    "命令行用 --period-times 1=08:00-08:50,2=09:00-09:50 指定。")
         out.append(Finding("error", "这些节次没有设置上下课时间：%s"
-                           % "、".join(str(m) for m in missing),
-                           "在界面上点「编辑节次时间…」补全，或换一个作息预设。"))
+                           % "、".join(str(m) for m in missing), tip))
 
     # ---- 5. 放假日期是不是白设了 ----
     if cfg.holidays:
@@ -144,22 +147,35 @@ def diagnose(cfg: Config, result: ParseResult, n_weeks: int = None) -> List[Find
 
     # ---- 6. 调休日是否有课要补 ----
     for m in cfg.makeup_days:
-        wd = m.follow_weekday if m.follow_weekday is not None else m.date.weekday()
+        own = m.date.weekday()
+        wd = m.follow_weekday if m.follow_weekday is not None else own
         delta = (m.date - cfg.week1_monday).days
         if delta < 0 or m.date > sem_end:
             out.append(Finding("warn", "调休日 %s 不在本学期范围内" % m.date))
             continue
         week = delta // 7 + 1
         hit = [r for r in result.records if r.day == wd and week in r.all_weeks()]
-        if hit:
+        if wd == own:
+            # 按当天星期几上课：这些课本就在循环日程里，不需要额外补（与 ics.build_day_map 同口径）
+            if hit:
+                out.append(Finding(
+                    "info", "%d月%d日（%s）调休上班，照常执行当天%s课表（%d 节课已在循环"
+                            "日程里，无需额外补）"
+                    % (m.date.month, m.date.day, WEEKDAY_SHORT[own], WEEKDAY_SHORT[wd],
+                       len(hit))))
+            else:
+                out.append(Finding(
+                    "info", "%d月%d日（%s）调休上班，当天本来没有%s的课"
+                    % (m.date.month, m.date.day, WEEKDAY_SHORT[own], WEEKDAY_SHORT[wd])))
+        elif hit:
             out.append(Finding(
                 "info", "%d月%d日（%s）调休上班，按第%d周%s课表补 %d 节课"
-                % (m.date.month, m.date.day, WEEKDAY_SHORT[m.date.weekday()],
+                % (m.date.month, m.date.day, WEEKDAY_SHORT[own],
                    week, WEEKDAY_SHORT[wd], len(hit))))
         else:
             out.append(Finding(
-                "info", "%d月%d日（%s）调休上班，但第%d周%s本来就没有课，无需补课"
-                % (m.date.month, m.date.day, WEEKDAY_SHORT[m.date.weekday()],
+                "info", "%d月%d日（%s）调休上班，要补第%d周%s的课，但那天这些课本来就没有"
+                % (m.date.month, m.date.day, WEEKDAY_SHORT[own],
                    week, WEEKDAY_SHORT[wd])))
 
     return out
