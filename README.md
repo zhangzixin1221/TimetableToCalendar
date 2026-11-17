@@ -61,25 +61,61 @@ Android 日历的 `.ics` 文件，并自动加上两类提醒：
 
 ```powershell
 TimetableToCalendar.exe --cli 课表.pdf
-TimetableToCalendar.exe --cli 课表.pdf -o 我的课表.ics --week1 2026-08-31 --preset 长安校区
+TimetableToCalendar.exe --cli 我的课表.xlsx                              # Excel 也能直接当输入
+TimetableToCalendar.exe --cli 课表.pdf -o 我的课表.ics --week1 2026-08-31
 TimetableToCalendar.exe --cli 课表.pdf --alarm 15 --night 21:30   # 提前 15 分钟 + 每晚 21:30 汇总
 TimetableToCalendar.exe --cli 课表.pdf --alarm 0 --night off       # 完全不要提醒
 TimetableToCalendar.exe --cli 课表.pdf --merge artifact            # 相连节次合并策略
 TimetableToCalendar.exe --cli 课表.pdf --remark-courses            # 备注课程也加为全天日程
 
-# 节假日联网获取（按学期自动推年份），并落成一份可手改的文件
-TimetableToCalendar.exe --cli 课表.pdf --fetch-holidays --save-holidays 节假日.txt
-TimetableToCalendar.exe --cli 课表.pdf --fetch-holidays 2026,2027 --holidays-refresh
+# Excel：模板 / 把解析结果导出核对（改完可直接当输入）
+TimetableToCalendar.exe --cli --xlsx-template 课表模板.xlsx
+TimetableToCalendar.exe --cli 课表.pdf --xlsx-out 核对.xlsx
+
+# 节假日默认联网获取；想落成可手改的文件：
+TimetableToCalendar.exe --cli 课表.pdf --save-holidays 节假日.txt
+TimetableToCalendar.exe --cli 课表.pdf --holidays-years 2026,2027 --holidays-refresh
 
 # 换学校 / 换教务系统
 TimetableToCalendar.exe --cli 课表.pdf --auto-layout               # 自动挑版式
-TimetableToCalendar.exe --cli 课表.pdf --list-layouts              # 有哪些内置版式
+TimetableToCalendar.exe --cli --list-layouts                       # 有哪些内置版式
 TimetableToCalendar.exe --cli 课表.pdf --dump-layout               # 看程序眼里的版面结构
 TimetableToCalendar.exe --cli --layout-template                    # 导出版式配置模板
 ```
 
 `--cli -h` 可以看到全部参数。从源码跑就把 `TimetableToCalendar.exe` 换成
 `python main.py`。
+
+---
+
+## Excel / CSV：门槛最低、结果最确定的入口
+
+PDF 解析再准也有猜的成分（版面还原、教室教师切分、时刻反查）。**Excel 没有这些问题**
+——单元格就是单元格。所以它既是"不想折腾 PDF"时的正门，也是"解析结果要改"时的退路。
+
+三个用法：
+
+1. **从零填**：`--xlsx-template 课表模板.xlsx`（界面「空模板…」）导出模板，一行一条课：
+   课程名称 / 课程代码 / 星期 / 节次 / 周次 / 教师 / 上课地点。填好直接当输入。
+2. **核对修改**（推荐）：`--xlsx-out 核对.xlsx`（界面「导出结果核对…」）把**解析结果**
+   导出成同一格式的 Excel → 在 Excel 里改错行 → 把这个文件当输入重新生成。
+   解析错的地方改一次就永久正确，不必和 PDF 解析较劲。
+3. **CSV**：Excel 里「另存为 CSV」也行（UTF-8 与 GBK 都认）。
+
+几个约定：
+
+- **列名不用一字不差**：`课程/课程名/课程名称/科目`、`教室/地点/上课地点`、
+  `教师/老师/任课教师`、`星期/周几`、`节次/上课节次`、`周次/起止周` 都认。
+  表头也不必在第 1 行（前面可以有标题行），程序会在前 10 行里找。
+- **星期**写「星期一」「周一」或 `1`–`7`；**节次**写 `1-2`、`1-2节`、`第1-2节` 或 `3`；
+  **周次**写 `1-16`、`2-16(双)`、`1,3,5`、`第3周`。
+- **一门课多段就写多行**（不同周次/教室/教师各一行），程序会自动合并同一格的同名课。
+- 出错会**指到具体位置**，例如「第 5 行「线性代数」的节次认不出来（'一二'），已跳过；
+  例：1-2 或 3」，而不是笼统报失败。
+- Excel 里填的是**第几周**，不是日期；具体哪天还要在程序里填「第 1 周周一」。
+
+> 注意：Excel 路径不读学期、姓名、学号这些元信息（它们只用于日历名），
+> 日历名会退化成「课表」。用 `--name` 或界面上的日历名自行指定即可。
 
 ---
 
@@ -313,6 +349,8 @@ python src\selftest.py  <你的课表.pdf>    # 端到端：解析 → 生成 �
 python src\smoke_test.py <你的课表.pdf>   # 界面烟雾测试（驱动界面逻辑走完整流程）
 python tools\test_holiday_fetch.py        # 联网节假日：合并/跨年/缓存/文本往返/错误分支
 python tools\test_layout.py               # 版式层：切分策略、周次归一、JSON 校验、自动识别
+python tools\test_timebased.py            # 「时刻制」课表：3位代码/时刻区间/教室教师粘连/反查
+python tools\test_xlsx.py                 # Excel：模板往返、列名别名、导出→导入一致、错误定位
 python tools\resize_test.py               # 窗口缩放回归（含极小窗口）
 python tools\resize_wm_test.py            # 窗口缩放回归（走窗口管理器，模拟拖边框）
 python tools\table_fit_test.py <课表.pdf>  # 预览表列宽自适应（左右缩放不许裁掉右边的列）

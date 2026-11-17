@@ -409,6 +409,17 @@ class App(tk.Tk):
         ui.Switch(w, text="自动识别", variable=self.var_auto_layout).pack(
             side="left", padx=(ui.SPACE["sm"], 0))
 
+        # 行 4：Excel —— 门槛最低的入口，也是「解析结果核对」的闭环
+        cell(4, 0, "Excel / CSV")
+        w = box(4, 3)
+        for _txt, _cmd in (("导出结果核对…", self._export_records_xlsx),
+                           ("空模板…", self._export_timetable_template)):
+            ui.RoundedButton(w, text=_txt, kind="ghost", height=ui.px(32),
+                             command=_cmd).pack(side="left",
+                                                padx=(ui.SPACE["xs"], 0))
+        mk(w, "（导出的结果改完可直接当课表文件选中）", small=True).pack(
+            side="left", padx=(ui.SPACE["sm"], 0))
+
         # ---- 提示行 ----
         # 这两条提示会随文字长度换行，是配置卡高度跳变的来源。它们的 <Configure>
         # 是「内容高度变了」最准的信号（内层高度是我们自己设的，不会因此收到事件），
@@ -716,10 +727,59 @@ class App(tk.Tk):
     # ------------------------------------------------------------------ 选文件
     def _pick_pdf(self):
         p = filedialog.askopenfilename(
-            title="选择课表 PDF",
-            filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")], parent=self)
+            title="选择课表文件（PDF，或 Excel/CSV 表格）",
+            filetypes=[("课表文件", "*.pdf *.xlsx *.xlsm *.csv"),
+                       ("PDF 文件", "*.pdf"),
+                       ("Excel 表格", "*.xlsx *.xlsm"),
+                       ("CSV 表格", "*.csv"),
+                       ("所有文件", "*.*")], parent=self)
         if p:
             self.load_pdf(p)
+
+    def _export_timetable_template(self):
+        """导出空 Excel 模板（给「自己整理一份」的人用）。"""
+        from .xlsx_source import write_xlsx
+        p = filedialog.asksaveasfilename(
+            title="导出 Excel 课表模板", defaultextension=".xlsx",
+            initialfile="课表模板.xlsx",
+            filetypes=[("Excel 表格", "*.xlsx"), ("CSV", "*.csv")], parent=self)
+        if not p:
+            return
+        try:
+            write_xlsx(p)
+        except Exception as exc:                       # noqa: BLE001
+            self._error("写文件失败", str(exc))
+            return
+        self.log("已导出 Excel 模板：%s" % p)
+        self.log("    「课表」工作表一行一条课；「填写说明」里列了认得的列名和格式。")
+        self._info("完成",
+                   "模板已导出：\n%s\n\n"
+                   "一行写一条课（课程名称/星期/节次/周次/教师/教室），\n"
+                   "填好后把它当输入文件选中即可生成日历。\n\n"
+                   "提示：把 PDF 解析结果导出成 Excel 再改，比从零填更快。" % p)
+
+    def _export_records_xlsx(self):
+        """把当前解析/解析结果导出成 Excel，供人工核对修改。"""
+        from .xlsx_source import write_xlsx
+        if not self.records:
+            self._info("提示", "还没有课程数据，请先「解析课表」。")
+            return
+        p = filedialog.asksaveasfilename(
+            title="把当前课表导出为 Excel（可在 Excel 里改，再导回来）",
+            defaultextension=".xlsx", initialfile="课表-核对.xlsx",
+            filetypes=[("Excel 表格", "*.xlsx"), ("CSV", "*.csv")], parent=self)
+        if not p:
+            return
+        try:
+            write_xlsx(p, self.records, include_help=False)
+        except Exception as exc:                       # noqa: BLE001
+            self._error("写文件失败", str(exc))
+            return
+        self.log("已导出 %d 条课程到：%s" % (len(self.records), p))
+        self.log("    在 Excel 里改好之后，用它当输入文件重新解析即可。")
+        self._info("完成",
+                   "已导出：\n%s\n\n改完之后把它选中当作课表文件，"
+                   "程序会直接读表格（不经过 PDF 解析）。" % p)
 
     def _pick_out(self):
         p = filedialog.asksaveasfilename(title="保存 .ics", defaultextension=".ics",
@@ -1031,15 +1091,25 @@ class App(tk.Tk):
         self.log("=" * 56)
         self._set_status("正在解析…", "info")
         try:
-            if self.var_auto_layout.get():
-                from .parser import detect_layout
-                self.log("自动识别版式…")
-                lay, _notes = detect_layout(pdf, log=self.log,
-                                            period_times=self.period_times)
-                self._apply_layout(lay, quiet=True)
-            # 把用户设定的作息表带进解析：时刻制课表要靠它反查第几节
-            self.result = parse_pdf(pdf, log=self.log, layout=self.layout,
-                                    period_times=self.period_times)
+            from .xlsx_source import XlsxError, is_table_file, read_any
+            if is_table_file(pdf):
+                self.log("输入类型：Excel/CSV（直接读单元格，不经过 PDF 版面解析）")
+                self.result = read_any(pdf)
+            else:
+                if self.var_auto_layout.get():
+                    from .parser import detect_layout
+                    self.log("自动识别版式…")
+                    lay, _notes = detect_layout(pdf, log=self.log,
+                                                period_times=self.period_times)
+                    self._apply_layout(lay, quiet=True)
+                # 把用户设定的作息表带进解析：时刻制课表要靠它反查第几节
+                self.result = parse_pdf(pdf, log=self.log, layout=self.layout,
+                                        period_times=self.period_times)
+        except XlsxError as exc:
+            self.log("Excel 有问题：%s" % exc)
+            self._set_status("Excel 有问题", "err")
+            self._error("Excel 有问题", str(exc))
+            return False
         except Exception as exc:                       # noqa: BLE001
             self.log("解析失败：%s" % exc)
             self._set_status("解析失败", "err")

@@ -53,8 +53,15 @@ def _periods_from_arg(spec: str):
 def _make_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="timetable", description="把教务系统课表 PDF 转成可导入手机日历的 .ics")
-    ap.add_argument("pdf", nargs="?", help="课表 PDF 路径")
-    ap.add_argument("-o", "--out", help="输出 .ics 路径（默认与 PDF 同名）")
+    ap.add_argument("pdf", nargs="?",
+                    help="课表文件：PDF（有文字层）或 Excel/CSV（.xlsx/.csv）")
+    ap.add_argument("-o", "--out", help="输出 .ics 路径（默认与输入同名）")
+    ap.add_argument("--xlsx-out", default=None, metavar="PATH",
+                    help="把解析结果导出成 Excel（供人工核对修改；改完可以把它当输入）")
+    ap.add_argument("--xlsx-template", nargs="?", const="__DEFAULT__", default=None,
+                    metavar="PATH",
+                    help="导出一份空的 Excel 模板（带表头、示例行与填写说明）后退出，"
+                         "不填路径就用 课表模板.xlsx")
     ap.add_argument("--week1", default="2026-08-31",
                     help="第 1 周的周一日期，格式 YYYY-MM-DD（默认 2026-08-31）")
     ap.add_argument("--preset", default=None,
@@ -168,9 +175,19 @@ def main(argv=None) -> int:
         print("怎么改：先 `--dump-layout 你的课表.pdf` 看程序眼里的结构，"
               "再照着 weeks_re / period_re / title_re 改；字段名写错会当场报错。")
         return 0
+    if args.xlsx_template:
+        from .xlsx_source import write_xlsx
+        path = "课表模板.xlsx" if args.xlsx_template == "__DEFAULT__" \
+            else args.xlsx_template
+        write_xlsx(path)
+        print("已导出 Excel 模板：%s" % path)
+        print("  「课表」工作表照着一行一条课填；「填写说明」里有列名别名和格式说明。")
+        print("  填好后直接用它当输入：--cli %s" % path)
+        return 0
     if not args.pdf:
         ap.print_usage(sys.stderr)
-        print("错误：要给定课表 PDF（只有 --list-layouts / --layout-template 可以不填）。",
+        print("错误：要给定课表文件（PDF 或 .xlsx/.csv）。"
+              "只有 --list-layouts / --layout-template / --xlsx-template 可以不填。",
               file=sys.stderr)
         return 2
     if not os.path.isfile(args.pdf):
@@ -186,8 +203,16 @@ def main(argv=None) -> int:
     # ---- 选版式 ----
     lay = _resolve_layout(args, ap, log)
 
+    # ---- Excel / CSV 输入：不走 PDF 解析，直接读单元格 ----
+    from .xlsx_source import XlsxError, is_table_file, read_any
+    is_table = is_table_file(args.pdf)
+
     # ---- 结构转储（写版式用的工具，不生成 ics）----
     if args.dump_layout:
+        if is_table:
+            print("错误：--dump-layout 只对 PDF 有意义；Excel 请直接打开表格看。",
+                  file=sys.stderr)
+            return 2
         from .debug_dump import dump_pdf
         print(dump_pdf(args.pdf, lay))
         return 0
@@ -216,13 +241,30 @@ def main(argv=None) -> int:
 
     # ---- 解析 ----
     try:
-        if args.auto_layout:
-            lay, _ = detect_layout(args.pdf, log=log,
-                                   period_times=period_times)
-        result = parse_pdf(args.pdf, log=log, layout=lay, period_times=period_times)
+        if is_table:
+            result = read_any(args.pdf)
+            log("输入类型：Excel/CSV（直接读单元格，不经过 PDF 版面解析）")
+        else:
+            if args.auto_layout:
+                lay, _ = detect_layout(args.pdf, log=log,
+                                       period_times=period_times)
+            result = parse_pdf(args.pdf, log=log, layout=lay,
+                               period_times=period_times)
+    except XlsxError as exc:
+        print("Excel 有问题：%s" % exc, file=sys.stderr)
+        return 2
     except Exception as exc:                        # noqa: BLE001
         print("解析失败：%s" % exc, file=sys.stderr)
         return 1
+
+    # ---- 把解析结果导出成 Excel，供人工核对/修改后再导回 ----
+    if args.xlsx_out:
+        from .xlsx_source import write_xlsx
+        write_xlsx(args.xlsx_out, result.records, include_help=False)
+        print("已把 %d 条课程导出到：%s" % (len(result.records), args.xlsx_out))
+        print("  → 可以在 Excel 里改错行，再用该文件作为输入重新生成（--xlsx-out 可反复用）")
+        if not args.out:
+            return 0
 
     if week1.weekday() != 0:
         print("提示：%s 不是周一，星期几会整体偏移，请确认。" % week1, file=sys.stderr)
