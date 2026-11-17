@@ -265,8 +265,13 @@ try:
                      class_alarm_min=None, night_summary=False))
     check("没 clock 又没作息必须报错", False, "没报错")
 except Exception as exc:                              # noqa: BLE001
-    check("没 clock 又没作息必须报错", "没有设置" in str(exc) or "作息时间" in str(exc),
-          str(exc)[:50])
+    msg = str(exc)
+    # 三件事都要有：指出缺哪一节、说明怎么补、给出至少一条可操作路径
+    check("没 clock 又没作息必须报错",
+          "9" in msg and ("上下课时间" in msg or "节次" in msg), msg[:60])
+    check("缺节次的报错要给出可操作的出路（界面/命令行/换版式 至少两条）",
+          sum(k in msg for k in ("节次时间", "--period-times", "--list-layouts")) >= 2,
+          msg[:100])
 
 # ============================================================ 6) 配置自检口径
 print("[6] doctor 与新字段一致")

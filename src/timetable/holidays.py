@@ -1,24 +1,20 @@
 # -*- coding: utf-8 -*-
-"""法定节假日与调休安排预设。
+"""法定节假日的数据模型与文件格式。
 
-数据来源：国务院办公厅《关于 2026 年部分节假日安排的通知》
-（2025 年 11 月 4 日，https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm）
+这里**只放类型和解析**，不放任何具体年份的安排：
+放假与调休的安排一律由 `holiday_fetch` 联网获取（按学年自动推该取哪几个自然年），
+取不到就用缓存的，再取不到就明确告诉用户"本次不处理节假日"，而不是偷偷套一份
+过期的预设 —— 后者正是本项目最警惕的"不报错、只算错"。
 
-2026 年与 2026-2027 秋季学期（2026-08-31 ~ 2027-01-17）相关的只有两个：
-
-    中秋节  9月25日（周五）至 27日（周日）放假，共 3 天。（无调休上班日）
-    国庆节  10月1日（周四）至 7日（周三）放假调休，共 7 天。
-            9月20日（周日）、10月10日（周六）上班。
-
-调休上班日怎么算：按高校通行做法（例如哈工大本科生院 2026-09-08 通知
-「9月20日（星期日）、10月10日（星期六）正常执行第三周星期日和第六周星期六的
-课程安排」），**调休日照常执行「当天星期几」的课表**，并不补别的星期的课。
-本课表周六、周日没有课，所以这两天不需要补课。
+仍然保留纯文本文件格式（`load_holiday_file`），它有三个正当用途：
+  1. 内网/离线机器，或用 `--holidays-url` 指一个内网镜像；
+  2. 学校自己调课，跟国务院安排不一致时手改；
+  3. 回归测试要一份确定的数据（见 fixtures/holidays-test.txt）。
 """
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
 
 
@@ -54,35 +50,6 @@ def _d(s: str) -> dt.date:
     return dt.date.fromisoformat(s)
 
 
-# 西北工业大学 2026-2027 学年秋季学期
-NWPU_2026_AUTUMN = dict(
-    name="西工大 2026-2027 秋（国务院 2026 年节假日安排）",
-    holidays=[
-        Holiday(_d("2026-09-25"), _d("2026-09-27"), "中秋节"),
-        Holiday(_d("2026-10-01"), _d("2026-10-07"), "国庆节"),
-    ],
-    makeup_days=[
-        MakeupDay(_d("2026-09-20"), None, "国庆调休上班（按第3周周日课表，本课表周日无课）"),
-        MakeupDay(_d("2026-10-10"), None, "国庆调休上班（按第6周周六课表，本课表周六无课）"),
-    ],
-)
-
-PRESETS = {
-    NWPU_2026_AUTUMN["name"]: NWPU_2026_AUTUMN,
-}
-
-DEFAULT_PRESET = NWPU_2026_AUTUMN["name"]
-
-# 默认带上这份安排（针对本课表的学期）
-DEFAULT_HOLIDAYS = list(NWPU_2026_AUTUMN["holidays"])
-DEFAULT_MAKEUP_DAYS = list(NWPU_2026_AUTUMN["makeup_days"])
-
-
-def get_preset(name):
-    p = PRESETS.get(name, NWPU_2026_AUTUMN)
-    return dict(holidays=list(p["holidays"]), makeup_days=list(p["makeup_days"]))
-
-
 def describe(holidays, makeup_days) -> str:
     bits = [h.label() for h in holidays] or ["未设置"]
     txt = "放假：" + "、".join(bits)
@@ -99,8 +66,12 @@ WEEKDAY_CN = {"周一": 0, "星期一": 0, "周二": 1, "星期二": 1, "周三"
 
 HOLIDAY_FILE_TEMPLATE = """\
 # 节假日安排文件（纯文本，UTF-8）
-# 面向以后学期的复用：不用改代码，写一个这样的文件即可，
-#   命令行：--holidays-file 这个文件
+#
+# 什么时候需要它：
+#   * 机器不能联网 / 校园网连不上数据源；
+#   * 学校自己调课，跟国务院安排不一致；
+#   * 想固定一份安排，不让它随数据源变化。
+# 平时直接用 --fetch-holidays（默认就会联网取）即可，不必手写这个文件。
 #
 # 每行格式（# 开头为注释，空行忽略）：
 #   放假 <开始日期> <结束日期> <名称>     例：放假 2027-04-04 2027-04-06 清明节
@@ -110,11 +81,7 @@ HOLIDAY_FILE_TEMPLATE = """\
 #       写明如「周一」= 那天补周一的课
 #
 # 日期一律用 YYYY-MM-DD。
-
-# 放假 2027-04-04 2027-04-06 清明节
-# 放假 2027-05-01 2027-05-05 劳动节
-# 放假 2027-06-18 2027-06-20 端午节
-# 调休 2027-04-25
+# 联网取到之后也可以用 --save-holidays 导出一份，再照它改。
 """
 
 

@@ -30,7 +30,6 @@ from .parser import (WEEKDAY_SHORT, ParseResult, Record, Segment, compress_weeks
                      expand_weeks, parse_pdf, verify_parse)
 
 MERGE_SEGMENTS = [("相连就合并", "all"), ("只合并碎片", "artifact"), ("不合并", "none")]
-HOL_SEGMENTS = [("内置预设", "preset"), ("联网获取", "fetch"), ("节假日文件", "file")]
 
 P = ui.PALETTE
 
@@ -106,7 +105,6 @@ class App(tk.Tk):
         self.var_merge = tk.StringVar(value="all")
         self.var_holiday = tk.BooleanVar(value=True)
         self.var_holiday_notice = tk.BooleanVar(value=True)
-        self.var_hol_src = tk.StringVar(value="preset")      # preset | fetch | file
         self.var_hol_years = tk.StringVar(value="")          # 空 = 按学期自动推年份
         self.var_holiday_hint = tk.StringVar()
         self.var_footer = tk.StringVar(value="选择课表 PDF，然后点右下角「解析课表」。")
@@ -236,25 +234,41 @@ class App(tk.Tk):
         return "break"
 
     def _apply_minsize(self):
-        """按屏幕大小决定「最小尺寸」和「打开时的默认尺寸」。
+        """决定「最小尺寸」和「打开时的推荐尺寸」。
 
-        两条经验（都踩过）：
+        三条经验（都踩过）：
         1. 最小尺寸不能按「内容完整可见」来定（那会把竖直方向锁死：内容要 1823 物理像素，
            而屏幕可用高度只有 1879，能拖的范围只剩 56 像素）。最小尺寸只保证顶栏、底栏、
            预览表各留一点可见高度，装不下的部分交给滚动条。
-        2. 默认尺寸要跟着屏幕走，别写死。这里取屏幕宽高各一半（面积约为整屏的四分之一），
-           再夹到 [最小尺寸, 屏幕可用范围] 之间 —— 大屏小屏、不同缩放下都不会一开窗就糊满屏幕。
+        2. 默认尺寸不用「屏幕的一半」这种拍脑袋的算法：它和内容无关，内容少时窗口空一大片、
+           内容多时一开窗就得滚。这里按**内容实际需要的尺寸**加余量来算，再夹到
+           [最小尺寸, 屏幕×0.85] 之间。
+        3. 算出来的推荐尺寸必须是**能一次看到完整内容**的（在这个尺寸下不该有滚动条），
+           否则「推荐」二字没有意义 —— 所以算完还要复核一次并向上补足。
         """
         try:
             self.update_idletasks()
-            self._need_h = int(self._inner.winfo_reqheight())
             sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
             min_w, min_h = ui.px(680), ui.px(470)
             self.minsize(int(min(min_w, sw - ui.px(20))), int(min(min_h, sh - ui.px(20))))
-            # 默认约 1/4 屏（宽高各一半），并保证不小于最小尺寸、不超出屏幕
-            w, h = ui.fit_size(self, sw // 2, sh // 2, margin=20)
-            w = max(int(w), int(min_w))
-            h = max(int(h), int(min_h))
+
+            hdr_h = self._hdr.winfo_reqheight()
+            ftr_h = self._ftr.winfo_reqheight()
+            self._need_h = int(self._inner.winfo_reqheight())
+            # 内容需要的宽高：内层自然宽 + 左右留白；高 = 顶栏 + 内容 + 底栏
+            need_w = int(self._inner.winfo_reqwidth()) + ui.px(2 * 16)
+            need_h = self._need_h + hdr_h + ftr_h + ui.px(8)
+
+            # 上限跟屏幕可用区域走（留出任务栏/标题栏），下限是最小尺寸。
+            # 注意：内容本身比屏幕还高时**必然**会有滚动条，那不是算错 —— 所以推荐尺寸
+            # 的含义是「能一次显示多少就显示多少」，而不是"保证不用滚"。
+            cap_w = int(sw - ui.px(32))
+            cap_h = int(sh - ui.px(48))
+            w = max(int(min_w), min(need_w, cap_w))
+            h = max(int(min_h), min(need_h, cap_h))
+            # 保证推荐尺寸下内容高度真的装得下（留一点余量吸收取整/字体差异）
+            h = max(h, min(need_h + ui.px(6), cap_h))
+            w, h = ui.fit_size(self, w, h, margin=16)
             self.geometry("%dx%d" % (w, h))
             self.update_idletasks()
             self._sync_scroll()
@@ -374,11 +388,8 @@ class App(tk.Tk):
                   command=self._refresh_holiday_hint).pack(side="left")
         ui.Switch(w, text="放假前一晚提醒", variable=self.var_holiday_notice).pack(
             side="left", padx=(ui.SPACE["md"], 0))
-        ui.Segmented(w, HOL_SEGMENTS, variable=self.var_hol_src,
-                     command=self._on_hol_src).pack(side="left",
-                                                    padx=(ui.SPACE["md"], 0))
 
-        # 行 3：节假日数据来源 ｜ 课表版式（换学校改这里，不用碰代码）
+        # 行 3：节假日（默认联网获取） ｜ 课表版式（换学校改这里，不用碰代码）
         cell(3, 0, "节假日数据")
         self._hol_box = box(3, 1)
         self._build_holiday_controls()
@@ -664,11 +675,7 @@ class App(tk.Tk):
         if not self.var_holiday.get():
             self.var_holiday_hint.set("未处理节假日（放假期间也会排课）")
             return
-        src = self.var_hol_src.get()
-        if src == "file":
-            if not self.holiday_file:
-                self.var_holiday_hint.set("节假日：还没选文件")
-                return
+        if self.holiday_file:
             try:
                 hs, ms = hol_mod.load_holiday_file(self.holiday_file)
                 self.var_holiday_hint.set("%s ｜ %s" % (
@@ -676,34 +683,31 @@ class App(tk.Tk):
             except hol_mod.HolidayFileError as exc:
                 self.var_holiday_hint.set("节假日文件有问题：%s" % exc)
             return
-        if src == "fetch":
-            if not self.hol_fetched:
-                self.var_holiday_hint.set("节假日：还没联网获取（点右边「联网获取…」）")
-                return
-            yh = self.hol_fetched
-            self.var_holiday_hint.set("%s ｜ %s年%s"
-                                      % (short(yh.holidays, yh.makeup_days),
-                                         "、".join(str(y) for y in yh.years),
-                                         "（缓存）" if yh.from_cache else ""))
+        if not self.hol_fetched:
+            self.var_holiday_hint.set("节假日：待获取（点右边「获取/刷新」）")
             return
-        self.var_holiday_hint.set(short(hol_mod.DEFAULT_HOLIDAYS,
-                                        hol_mod.DEFAULT_MAKEUP_DAYS))
+        yh = self.hol_fetched
+        self.var_holiday_hint.set("%s ｜ %s年%s"
+                                  % (short(yh.holidays, yh.makeup_days),
+                                     "、".join(str(y) for y in yh.years),
+                                     "（缓存）" if yh.from_cache else ""))
 
     def _holidays_for_config(self):
-        src = self.var_hol_src.get() if self.var_holiday.get() else "off"
-        if src == "off":
+        """生成时到底用哪份节假日。
+
+        顺序：显式指定的文件 > 已经联网取到的 > 现场联网取一次 > 放弃（返回空）。
+        **联网失败不抛异常**：节假日取不到只该"少扣几天假"，不该让用户拿不到日历。
+        真正需要精确控制的场景用「选择文件…」。
+        """
+        if not self.var_holiday.get():
             return [], []
-        if src == "file":
-            if not self.holiday_file:
-                raise IcsError("节假日来源选了「节假日文件」，但还没选文件。"
-                               "请点「选择文件…」，或把来源改回内置预设。")
+        if self.holiday_file:
             return hol_mod.load_holiday_file(self.holiday_file)
-        if src == "fetch":
-            if not self.hol_fetched:
-                raise IcsError("节假日来源选了「联网获取」，但还没取过数据。"
-                               "请先点「联网获取…」（要联网，失败会说明原因）。")
-            return list(self.hol_fetched.holidays), list(self.hol_fetched.makeup_days)
-        return list(hol_mod.DEFAULT_HOLIDAYS), list(hol_mod.DEFAULT_MAKEUP_DAYS)
+        if not self.hol_fetched and not self._fetch_holidays(silent=True):
+            return [], []
+        if not self.hol_fetched:
+            return [], []
+        return list(self.hol_fetched.holidays), list(self.hol_fetched.makeup_days)
 
     def _on_preset(self):
         self.period_times = presets.get_preset(self.var_preset.get(), self.layout)
@@ -747,7 +751,6 @@ class App(tk.Tk):
             self._warn("提示", "这个文件里没有任何「放假」或「调休」行。")
             return
         self.holiday_file = p
-        self.var_hol_src.set("file")
         self._build_holiday_controls()
         self.log("已载入节假日文件：%s" % p)
         for h in hs:
@@ -769,21 +772,20 @@ class App(tk.Tk):
             self._error("写文件失败", str(exc))
             return
         self.log("已导出模板：%s" % p)
-        self.log("下学期照着改这个文件，再用「节假日数据 → 选择文件…」选它即可。")
+        self.log("下学期照着改这个文件，再用「用文件…」选它即可。")
         self._info("完成", "模板已导出：\n%s\n\n下学期改这个文件即可，不必动代码。" % p)
 
-    # ------------------------------------------------------------ 节假日数据来源
+    # ------------------------------------------------------------ 节假日（联网获取）
     def _build_holiday_controls(self):
-        """按「内置预设 / 联网获取 / 节假日文件」三种来源换一排控件。
+        """节假日这一排：默认就是「联网获取」，其它入口退到次要位置。
 
-        为什么做成三选一而不是几个按钮并排：并排的话用户会不知道当前到底在用哪份
-        节假日数据，而「以为在用联网数据、其实还在用上学期的内置预设」正是本项目
-        最警惕的静默错误。选中的来源直接决定这一排显示什么，所见即所用。
+        为什么不再做「内置/联网/文件」三选一：内置预设已经删了（过期的安排比没有
+        更危险），文件只是离线兜底。默认联网 + 缓存，界面上只留一个状态和两个动作，
+        用户不需要理解"来源"这件事。
         """
         for c in self._hol_box.winfo_children():
             c.destroy()
         box = self._hol_box
-        src = self.var_hol_src.get()
 
         def label(text, small=True):
             tk.Label(box, text=text, bg=P["card"],
@@ -795,49 +797,46 @@ class App(tk.Tk):
             ui.RoundedButton(box, text=text, kind="ghost", height=ui.px(32),
                              command=cmd).pack(side="left", padx=(padx, 0))
 
-        if src == "preset":
-            label("内置：%s" % hol_mod.DEFAULT_PRESET)
-            button("换成节假日文件…", lambda: (self.var_hol_src.set("file"),
-                                               self._build_holiday_controls()))
-        elif src == "fetch":
-            tk.Label(box, text="年份", bg=P["card"], fg=P["text2"],
-                     font=ui.FONTS["body"]).pack(side="left")
-            ui.RoundedInput(box, textvariable=self.var_hol_years,
-                            width=ui.px(96)).pack(side="left", padx=(ui.SPACE["xs"], 0))
-            label("（空 = 按「第 1 周周一 + 周次」自动推）")
-            button("联网获取…", self._fetch_holidays)
-        else:
-            name = os.path.basename(self.holiday_file) if self.holiday_file else "未选择"
-            label("文件：%s" % name)
-            button("选择文件…", self._pick_holiday_file)
-            button("导出模板", self._export_holiday_template)
+        tk.Label(box, text="年份", bg=P["card"], fg=P["text2"],
+                 font=ui.FONTS["body"]).pack(side="left")
+        ui.RoundedInput(box, textvariable=self.var_hol_years,
+                        width=ui.px(96)).pack(side="left", padx=(ui.SPACE["xs"], 0))
+        label("（空 = 按学期自动）")
+        button("获取/刷新", self._fetch_holidays)
+        button("存成文件…", self._save_holidays_as_file)
+        button("用文件…", self._pick_holiday_file)
         self._refresh_holiday_hint()
         # 这一排控件换过之后，配置卡高度变了，内层高度要跟着重新校（见 _settle）
         self._settle()
 
-    def _on_hol_src(self):
-        self._build_holiday_controls()
+    def _fetch_holidays(self, silent=False):
+        """联网取法定节假日安排。
 
-    def _fetch_holidays(self):
-        """联网取法定节假日安排。取到就当作当前来源用；取不到**不会**退回内置预设。"""
+        silent=True 用于「生成前顺手取一次」：失败只写日志，不弹窗打断。
+        取不到**不会**退回任何内置预设（那正是过期数据混进来的路径）。
+        """
         from .holiday_fetch import HolidayFetchError, fetch_year, holidays_for_range
 
         spec = (self.var_hol_years.get() or "").strip()
-        self.log("")
-        self._set_status("正在联网获取节假日…", "info")
-        self.update_idletasks()
+        if not silent:
+            self.log("")
+            self._set_status("正在联网获取节假日…", "info")
+            self.update_idletasks()
         try:
             if not spec:
-                if not self.records:
-                    raise HolidayFetchError(
-                        "没有填年份，就得先「解析课表」，程序才知道这个学期跨了哪几个自然年。")
-                weeks = [w for r in self.records for w in r.all_weeks()]
-                max_week = max(weeks) if weeks else 19
+                # 年份取决于「学期跨了哪几个自然年」。没解析课表时按 19 周估一个范围
+                # （节假日只跟学期起止有关，跟具体课表无关），这样用户在解析前也能先取。
                 try:
                     w1 = dt.date.fromisoformat(self.var_week1.get().strip())
                 except ValueError:
                     raise HolidayFetchError(
                         "「第 1 周周一」要先填对（格式 2026-08-31），才知道去取哪几年的数据。")
+                if self.records:
+                    weeks = [w for r in self.records for w in r.all_weeks()]
+                    max_week = max(weeks) if weeks else 19
+                else:
+                    max_week = 19
+                    self.log("（还没解析课表，按 19 周估算学期范围）")
                 yh = holidays_for_range(w1, w1 + dt.timedelta(weeks=max_week)
                                         - dt.timedelta(days=1))
                 self.log("联网获取节假日：按学期 %s ~ %s 推到年份 %s"
@@ -852,16 +851,19 @@ class App(tk.Tk):
                     yh = holidays_for_range(dt.date(ys[0], 1, 1), dt.date(ys[-1], 12, 31))
         except ValueError:
             self._set_status("年份格式不对", "err")
-            self._error("年份格式不对",
-                        "「年份」要么留空（自动推），要么写 2026，要么写 2026,2027。")
+            if not silent:
+                self._error("年份格式不对",
+                            "「年份」要么留空（自动推），要么写 2026，要么写 2026,2027。")
             return False
         except HolidayFetchError as exc:
             # 这条信息本身就写清了「试了哪些地址、为什么失败、下一步怎么办」，
-            # 所以整段进日志，弹窗只挑第一行，别把用户淹死。
+            # 所以整段进日志；非 silent 时才弹窗挑第一行，别把用户淹死。
             self.log(str(exc))
             self._set_status("联网获取失败", "err")
-            self._error("联网获取节假日失败", str(exc).splitlines()[0] +
-                        "\n\n完整说明在日志区（含可操作的下一步）。")
+            if not silent:
+                self._error("联网获取节假日失败", str(exc).splitlines()[0] +
+                            "\n\n完整说明在日志区。取不到时仍可生成日历，"
+                            "只是不会扣除放假当天的课。")
             return False
         self.hol_fetched = yh
         for line in yh.describe().splitlines():
@@ -892,9 +894,8 @@ class App(tk.Tk):
             self._error("写文件失败", str(exc))
             return
         self.holiday_file = p
-        self.var_hol_src.set("file")
         self._build_holiday_controls()
-        self.log("已存成节假日文件（学校临时调课就改这份，再用「选择文件…」选它）：%s" % p)
+        self.log("已存成节假日文件（学校临时调课就改这份，再用「用文件…」选它）：%s" % p)
 
     # ------------------------------------------------------------------ 版式
     def _apply_layout(self, lay, quiet=False):
@@ -1064,6 +1065,10 @@ class App(tk.Tk):
             self.log("备注中无固定时间的课程：%s"
                      % "、".join(c["name"] for c in md.remark_courses))
         self._refresh_table()
+        # 解析完顺手把节假日取一次（有缓存时几乎是瞬时的）。失败只写日志、不打断：
+        # 用户可能只是想先看看解析对不对，不该被一个网络问题挡住。
+        if self.var_holiday.get() and not self.hol_fetched and not self.holiday_file:
+            self._fetch_holidays(silent=True)
         self._reveal_log()
         return True
 

@@ -1,17 +1,12 @@
 # -*- coding: utf-8 -*-
-"""作息时间预设。
+"""作息时间（每节课几点上、几点下）。
 
-以前这份表直接写死在西工大上，现在它跟着「版式」走：每套版式自带
-`period_presets`（见 layout.py），换学校就换到那所学校的作息，界面上的下拉框也会
-跟着换。本模块只保留两件事：
+数据全部跟着「版式」走（见 layout.py 的 `period_presets`）：内置的通用版式带一份
+45 分钟/节的通用作息，界面上的下拉框列的就是当前版式自带的那几套，用户也可以
+手改（改完若与某套预设一致，下拉框会自动跳回那套的名字）。
 
-  1. 兼容层：`PRESETS` / `CHANGAN` / `DEFAULT_PRESET` 仍是西工大的作息，
-     老脚本（selftest.py、tools/*.py）照旧能用；
-  2. 取表函数：`presets_for(layout)` / `get_preset(name, layout)` 才是新代码该用的。
-
-数据来源：西北工业大学官方《课程节次时间表》
-  * 长安校区：1 节 08:30-09:15 … 13 节 20:40-21:25
-  * 友谊校区：分冬季（10.1-4.30）与夏季（5.1-9.30），每节 50 分钟，只有 1~12 节
+本模块只做取值与查询，**不含任何具体学校的作息表** —— 学校专属作息属于版式配置
+（内置的或用户自己写的 JSON），不写死在代码里。
 """
 from __future__ import annotations
 
@@ -19,20 +14,13 @@ from typing import Dict, Optional, Tuple
 
 from .layout import BUILTIN, DEFAULT_LAYOUT_ID, Layout, REGISTRY
 
-_NWPU = BUILTIN[DEFAULT_LAYOUT_ID]
-
-CHANGAN = _NWPU.preset_times("西北工业大学 · 长安校区")
-YOUYI_WINTER = _NWPU.preset_times("西北工业大学 · 友谊校区（冬季 10.1-4.30）")
-YOUYI_SUMMER = _NWPU.preset_times("西北工业大学 · 友谊校区（夏季 5.1-9.30）")
-
-PRESETS: Dict[str, Dict[int, Tuple[str, str]]] = _NWPU.all_period_presets()
-DEFAULT_PRESET = _NWPU.default_preset
+_DEFAULT_LAYOUT = BUILTIN[DEFAULT_LAYOUT_ID]
 
 
 def layout_of(layout) -> Layout:
-    """允许调用方传版式对象、版式 id，或者干脆不传（= 西工大）。"""
+    """允许调用方传版式对象、版式 id，或者干脆不传（= 默认的通用版式）。"""
     if layout is None:
-        return _NWPU
+        return _DEFAULT_LAYOUT
     if isinstance(layout, Layout):
         return layout
     return REGISTRY.get(str(layout))
@@ -43,8 +31,8 @@ def presets_for(layout=None) -> Dict[str, Dict[int, Tuple[str, str]]]:
 
 
 def preset_names(layout=None) -> list:
-    """这套版式自带哪几份作息。**没有就是空列表** —— 绝不能拿西工大的表去顶，
-    否则换了学校还显示「西北工业大学 · 长安校区」，用户以为有作息其实是错的。"""
+    """这套版式自带哪几份作息。**没有就是空列表** —— 绝不能拿别的版式的表去顶，
+    否则换了学校还显示上一所学校的节次时间，用户以为有作息其实是错的。"""
     return list(presets_for(layout))
 
 

@@ -46,21 +46,33 @@ if minh > need_h * 0.75:
 else:
     print("竖直方向可自由缩放：最小 %d < 内容自然高 %d" % (minh, need_h))
 
-# 打开时的默认尺寸：应当跟着屏幕走，面积约为整屏的四分之一（宽高各一半），
-# 并且不小于最小尺寸、不超出屏幕
-screen_w = app.winfo_screenwidth()
+# 打开时的默认尺寸 = **推荐尺寸**：按内容实际需要来定，再夹到 [最小尺寸, 屏幕可用]。
+# （以前这里要求「面积≈四分之一屏」，那是个与内容无关的拍脑袋算法：内容少时窗口空一大片，
+#   内容多时一开窗就得滚。现在改为检验三条真正有意义的契约。）
+screen_w, screen_h = app.winfo_screenwidth(), app.winfo_screenheight()
 sw, sh = app.winfo_width(), app.winfo_height()
-ratio = float(sw * sh) / float(screen_w * screen_h)
-print("默认窗口 %dx%d（逻辑 %dx%d）≈ 屏幕面积的 %.1f%%"
-      % (sw, sh, sw // 2, sh // 2, ratio * 100))
-if not (0.15 <= ratio <= 0.35):
-    print("!! 默认窗口面积占比 %.1f%% 偏离「四分之一屏」太多" % (ratio * 100))
-    bad += 1
-elif sw < minw - 2 or sh < minh - 2 or sw > screen_w or sh > screen_h:
-    print("!! 默认尺寸不在 [最小尺寸, 屏幕] 范围内")
-    bad += 1
+need_h = app._inner.winfo_reqheight() + app._hdr.winfo_reqheight() + app._ftr.winfo_reqheight()
+print("默认窗口 %dx%d（屏幕 %dx%d）内容需要高 %d，占比 %.1f%%"
+      % (sw, sh, screen_w, screen_h, need_h, 100.0 * sh / screen_h))
+problems = []
+# (1) 不许小于最小尺寸，也不许超出屏幕
+if sw < minw - 2 or sh < minh - 2:
+    problems.append("默认尺寸小于最小尺寸")
+if sw > screen_w or sh > screen_h:
+    problems.append("默认尺寸超出屏幕")
+# (2) 推荐尺寸必须尽量把内容显示全：要么装得下内容，要么已经顶到屏幕上限
+if sh + 2 < need_h and sh < screen_h - app.winfo_fpixels("1i") // 2:
+    problems.append("内容高 %d，窗口高 %d：既没装下内容也没顶到屏幕上限"
+                    % (need_h, sh))
+# (3) 宽度必须够，不能一开窗就因为窄而把表格右列裁掉
+if sw < app._inner.winfo_reqwidth():
+    problems.append("窗口宽 %d 小于内容需要宽 %d" % (sw, app._inner.winfo_reqwidth()))
+if problems:
+    for p in problems:
+        print("!! " + p)
+    bad += len(problems)
 else:
-    print("    默认尺寸合适：约四分之一屏，且不小于最小尺寸")
+    print("    推荐尺寸合适：按内容算、夹在 [最小尺寸, 屏幕] 之间")
 
 
 def find_cards(w, out=None):

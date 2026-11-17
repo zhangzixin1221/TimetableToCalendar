@@ -21,6 +21,7 @@ import sys
 from timetable import holidays as hol_mod
 from timetable import presets
 from timetable.ics import Config, build_ics, merge_contiguous, sanity_check_ics
+from timetable.layout import DEFAULT_LAYOUT_ID, REGISTRY
 from timetable.parser import WEEKDAY_SHORT, compress_weeks, parse_pdf, verify_parse
 
 def _find_pdf():
@@ -44,6 +45,19 @@ if not PDF:
 WEEK1 = dt.date(2026, 8, 31)
 TZ = dt.timezone(dt.timedelta(hours=8))
 
+# 节假日用**固定的测试文件**，不联网：测试必须确定，不能把外部数据状态写进断言。
+# fixtures/holidays-test.txt 的内容与数据源实测一致（tools/test_holiday_fetch.py 会
+# 真联网交叉校验那一点），但这里离线可跑、年年可跑。
+_HOL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         os.pardir, "fixtures", "holidays-test.txt")
+_HOL_FILE = os.path.normpath(_HOL_FILE)
+if os.path.isfile(_HOL_FILE):
+    HOLIDAYS, MAKEUP = hol_mod.load_holiday_file(_HOL_FILE)
+else:
+    print("缺少测试用节假日文件：%s" % _HOL_FILE)
+    print("（它只是测试数据；程序正常运行是联网获取，不依赖这个文件）")
+    raise SystemExit(2)
+
 ok_all = True
 
 
@@ -61,7 +75,7 @@ print("输入：%s" % PDF)
 print("=" * 92)
 
 # ---------------------------------------------------------------- 1) 解析
-res = parse_pdf(PDF)
+res = parse_pdf(PDF, layout=REGISTRY.get(DEFAULT_LAYOUT_ID))
 md = res.meta
 print("\n[1] 解析")
 print("    学期=%s  年级=%s  学院=%s  专业=%s  班级=%s  姓名=%s  总学分=%s"
@@ -84,11 +98,10 @@ for mode in ("all", "artifact", "none"):
     # 注意：这里对同一个 ParseResult 反复生成 3 次，正好可以验证
     # merge_contiguous 不会就地改写解析结果（否则后两种模式会用被改过的数据）
     cfg = Config(week1_monday=WEEK1,
-                 period_times=presets.get_preset(presets.DEFAULT_PRESET),
+                 period_times=presets.get_preset(None, REGISTRY.get(DEFAULT_LAYOUT_ID)),
                  class_alarm_min=20, night_summary=True, night_hour=22, night_minute=0,
                  merge_mode=mode, calendar_name="自检",
-                 holidays=hol_mod.DEFAULT_HOLIDAYS,
-                 makeup_days=hol_mod.DEFAULT_MAKEUP_DAYS)
+                 holidays=HOLIDAYS, makeup_days=MAKEUP)
     text, stats = build_ics(res, cfg)
 
     st = sanity_check_ics(text)
@@ -162,7 +175,7 @@ for mode in ("all", "artifact", "none"):
 
     # 6) 法定节假日当天不能有课
     hol_dates = set()
-    for h in hol_mod.DEFAULT_HOLIDAYS:
+    for h in HOLIDAYS:
         hol_dates.update(h.dates())
     on_holiday = sorted(d for d in by_date if d in hol_dates)
     check("法定节假日当天没有课", not on_holiday,
@@ -173,8 +186,8 @@ for mode in ("all", "artifact", "none"):
     notices = sorted((o for o in night_occ if "放假" in str(o["SUMMARY"])),
                      key=lambda o: o["DTSTART"].dt)
     check("每个法定假期都有放假提醒",
-          len(notices) == len(hol_mod.DEFAULT_HOLIDAYS),
-          "提醒 %d 条 / 假期 %d 个" % (len(notices), len(hol_mod.DEFAULT_HOLIDAYS)))
+          len(notices) == len(HOLIDAYS),
+          "提醒 %d 条 / 假期 %d 个" % (len(notices), len(HOLIDAYS)))
     for o in notices:
         print("        %s -> %s" % (o["DTSTART"].dt.strftime("%m-%d %H:%M"),
                                     str(o["SUMMARY"])))
@@ -197,10 +210,10 @@ from timetable import doctor as _doc
 def _cfg(week1, holidays=None, makeup=None):
     return Config(
         week1_monday=week1,
-        period_times=presets.get_preset(presets.DEFAULT_PRESET),
+        period_times=presets.get_preset(None, REGISTRY.get(DEFAULT_LAYOUT_ID)),
         class_alarm_min=20, night_summary=True, night_hour=22, night_minute=0,
-        holidays=hol_mod.DEFAULT_HOLIDAYS if holidays is None else holidays,
-        makeup_days=hol_mod.DEFAULT_MAKEUP_DAYS if makeup is None else makeup)
+        holidays=HOLIDAYS if holidays is None else holidays,
+        makeup_days=MAKEUP if makeup is None else makeup)
 
 
 f_ok = _doc.diagnose(_cfg(WEEK1), res)

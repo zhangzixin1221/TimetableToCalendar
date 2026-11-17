@@ -422,7 +422,12 @@ def test_http_404_real_probe():
 
 
 def test_live_2026_crosscheck():
-    """真联网拉 2026，与 holidays.DEFAULT_HOLIDAYS / DEFAULT_MAKEUP_DAYS 交叉比对。"""
+    """真联网拉 2026，与「按国务院办公厅通知手抄的期望值」交叉比对。
+
+    以前这里比的是 holidays.DEFAULT_HOLIDAYS（程序内置的 2026 预设）。那份预设已经
+    删掉了 —— 程序只走联网，内置一份会过期的数据比没有更危险。但「联网数据对不对」
+    这件事仍然要有人验，所以期望值改成写在这里：它是测试的职责，不是程序的配置。
+    """
     fresh_env()
     try:
         yh = hf.fetch_year(2026, timeout=15)
@@ -431,17 +436,20 @@ def test_live_2026_crosscheck():
             print("    SKIP：本机当前无法访问 holiday-cn（离线环境），跳过交叉比对")
             return
         raise
-    # 2026 秋学期相关的两条硬编码预设，必须逐字段命中联网数据
-    for d in hol.DEFAULT_HOLIDAYS:
-        assert d in yh.holidays, "联网数据里没有硬编码预设的 %s" % d
-    # 名称也要对得上（国务院口径就是「中秋节」「国庆节」）
+    # 2026 年国务院办公厅《关于 2026 年部分节假日安排的通知》，逐条手抄
     names = {(h.name, h.start, h.end) for h in yh.holidays}
+    assert ("元旦", _D("2026-01-01"), _D("2026-01-03")) in names, sorted(map(str, names))
+    assert ("春节", _D("2026-02-15"), _D("2026-02-23")) in names, sorted(map(str, names))
+    assert ("清明节", _D("2026-04-04"), _D("2026-04-06")) in names, sorted(map(str, names))
+    assert ("劳动节", _D("2026-05-01"), _D("2026-05-05")) in names, sorted(map(str, names))
+    assert ("端午节", _D("2026-06-19"), _D("2026-06-21")) in names, sorted(map(str, names))
     assert ("中秋节", _D("2026-09-25"), _D("2026-09-27")) in names
     assert ("国庆节", _D("2026-10-01"), _D("2026-10-07")) in names
     mk = {m.date for m in yh.makeup_days}
     assert mk == {_D("2026-01-04"), _D("2026-02-14"), _D("2026-02-28"),
                   _D("2026-05-09"), _D("2026-09-20"), _D("2026-10-10")}, sorted(mk)
-    assert {m.date for m in hol.DEFAULT_MAKEUP_DAYS} <= mk
+    # 调休日一律「按当天星期几执行」（follow_weekday=None），程序据此不重复补课
+    assert all(m.follow_weekday is None for m in yh.makeup_days)
     assert yh.papers and "gov.cn" in yh.papers[0]
     assert yh.from_cache is False
     # 再走一次内存缓存，结果必须逐条一致（除 from_cache 标注）

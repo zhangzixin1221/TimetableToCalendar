@@ -172,9 +172,13 @@ def _check_periods(records: List[Record], period_times: Dict[int, Tuple[str, str
                       for p in range(r.pfrom, r.pto + 1) if p not in period_times})
     if missing:
         raise IcsError(
-            "节次 %s 没有设置上下课时间。请在「作息时间」里补全（可选用预设，或手动编辑）；"
-            "命令行用 --period-times 1=08:30-09:15,2=09:25-10:10 指定。"
-            % "、".join(str(m) for m in missing))
+            "这些课程用到的节次没有上下课时间：%s\n"
+            "  处理办法（任选）：\n"
+            "    1) 界面点「节次时间…」补全（内置通用作息默认到第 %d 节，超出部分要自己填）；\n"
+            "    2) 命令行 --period-times 13=21:45-22:30,14=22:40-23:25 这样指定；\n"
+            "    3) 换一份自带该校作息的版式：--list-layouts 看有哪些。"
+            % ("、".join(str(m) for m in missing),
+               max(period_times) if period_times else 0))
 
 
 def class_times(r: Record, period_times: Dict[int, Tuple[str, str]]) -> Tuple[str, str]:

@@ -84,6 +84,9 @@ def split_room_teacher(rest: str, how: str = "space_tail_name") -> Tuple[str, st
     if how == "space_tail_room":
         return _space_tail(rest, squeeze, teacher_at_end=False)
 
+    if how == "auto":
+        return _space_tail_auto(rest, squeeze)
+
     return _space_tail(rest, squeeze, teacher_at_end=True)
 
 
@@ -124,7 +127,33 @@ def _looks_like_room(tok: str) -> bool:
     return bool(re.search(r"[0-9A-Za-z]", tok)) or bool(_PLACE_TAIL.search(tok))
 
 
-# ------------------------------------------------------------------ 周次表达式
+def _space_tail_auto(rest: str, squeeze) -> Tuple[str, str]:
+    """自动判「教室在前还是教师在前」。
+
+    这是「通用版式」要解决的问题：不同教务系统的行尾顺序是反的，而我们没有任何
+    先验知识。判据看行尾那一段的**形状**：
+      * 像教室（含数字/字母，或以「楼/馆/室/场/厅/区/中心/基地」等结尾）
+        → 它后面若还剩 2~4 个汉字，那是教师（教室在前）。
+      * 不像教室、但本身是 2~4 个汉字，且它前面那段像教室
+        → 它是教师（教师在前、教室在中间），把前面那段当教室。
+      * 都不像 → 整段当教室，不猜教师（宁可少一个字段，也不要张冠李戴）。
+    """
+    parts = rest.split()
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return squeeze(parts[0]), ""
+    last, prev = parts[-1], parts[-2]
+    if _looks_like_room(last) and re.fullmatch(r"[\u4e00-\u9fff·]{2,4}", prev):
+        prefix = [p for p in parts[:-2] if not _SCHEDULE_NOISE.match(p)]
+        return squeeze(" ".join(prefix + [last])), squeeze(prev)
+    if (not _looks_like_room(last)) and re.fullmatch(r"[\u4e00-\u9fff·]{2,4}", last) \
+            and any(_looks_like_room(p) for p in parts[:-1]):
+        return squeeze(" ".join(parts[:-1])), squeeze(last)
+    return squeeze(rest), ""
+
+
+# ------------------------------------------------------------------- 周次表达式
 _WEEK_RANGE = re.compile(r"^\s*(\d{1,2})\s*(?:[-~—–]|至)\s*(\d{1,2})\s*$")
 
 
@@ -262,7 +291,8 @@ class Layout:
             except re.error as exc:
                 raise LayoutError("版式 %s 的 %s 不是合法正则：%s" % (self.id, fname, exc)) from exc
         for how in (self.room_teacher,):
-            if how not in ("space_tail_name", "space_tail_room", "labels", "room_only", "none"):
+            if how not in ("space_tail_name", "space_tail_room", "labels", "room_only",
+                           "none", "auto"):
                 raise LayoutError("版式 %s 的 room_teacher 取值不认识：%r" % (self.id, how))
         if self.entry_mode not in ("block", "inline", "table"):
             raise LayoutError("版式 %s 的 entry_mode 取值不认识：%r" % (self.id, self.entry_mode))
@@ -352,6 +382,42 @@ _NWPU_YOUYI_SUMMER = {str(i): list(v) for i, v in {
     10: ("17:40", "18:30"), 11: ("19:30", "20:20"), 12: ("20:30", "21:20"),
 }.items()}
 
+# --------------------------------------------------------- 内置：通用（默认）
+# 目标是「不假设任何一所学校」。能认的东西都是课表这种文档的**结构共性**：
+#   七列星期、格子里有课程名、有「周次」和「节次」、有教室和教师（顺序不假设）。
+# 刻意放宽松的部分：
+#   * 周次/节次的括号可有可无（`(1~16周)` / `1-16周` / `第1-16周` 都认）
+#   * 节次允许单节写法（`3节`）
+#   * 教室与教师的先后顺序由 _space_tail_auto 按形状现场判断，不写死
+# 通用作息：45 分钟/节，覆盖到第 13 节（不少学校是 4 早 + 5 午 + 4 晚）。
+# **这是一份可编辑的默认值，不是任何一所学校的真实作息** —— 实际时间请用户按本校
+# 课表改（界面「节次时间…」），或用 --period-times 指定。PDF 上若印了上下课时刻，
+# 程序会优先用 PDF 的，根本不看这张表。
+GENERIC_PERIODS = {str(i): list(v) for i, v in {
+    1: ("08:00", "08:45"), 2: ("08:55", "09:40"),
+    3: ("10:00", "10:45"), 4: ("10:55", "11:40"),
+    5: ("13:30", "14:15"), 6: ("14:25", "15:10"),
+    7: ("15:20", "16:05"), 8: ("16:15", "17:00"),
+    9: ("17:10", "17:55"),
+    10: ("19:00", "19:45"), 11: ("19:55", "20:40"),
+    12: ("20:50", "21:35"), 13: ("21:45", "22:30"),
+}.items()}
+
+GENERIC = Layout(
+    id="generic",
+    name="通用课表（自动判断结构）",
+    note="不假设具体学校：括号可有可无、节次可单节、教室与教师谁在前由程序判断。"
+         "对不上时用「看结构」看程序眼里的版面，再写一份版式文件。",
+    entry_mode="block",
+    specificity=25,                 # 比写死括号的版式宽松，但结构要求仍然具体
+    weeks_re=r"[(（]?(?P<a>\d{1,2})(?:\s*[-~—–至]\s*(?P<b>\d{1,2}))?"
+             r"\s*(?:[(（](?P<parity>[单双])[)）])?\s*周[)）]?",
+    period_re=r"[(（]?(?P<pfrom>\d{1,2})(?:\s*[-~—–至]\s*(?P<pto>\d{1,2}))?\s*节[)）]?",
+    room_teacher="auto",
+    period_presets={"通用作息（45 分钟/节，可编辑）": GENERIC_PERIODS},
+    default_preset="通用作息（45 分钟/节，可编辑）",
+)
+
 NWPU = Layout(
     id="nwpu",
     name="西北工业大学 · 学生课表",
@@ -412,8 +478,9 @@ TABLE = Layout(
     term_re=r"(?P<a>\d{4})\s*[-–—~至]\s*(?P<b>\d{4})\s*(?P<season>[秋冬春夏])?",
 )
 
-BUILTIN: Dict[str, Layout] = {x.id: x for x in (NWPU, INLINE, TABLE)}
-DEFAULT_LAYOUT_ID = NWPU.id
+BUILTIN: Dict[str, Layout] = {x.id: x for x in (GENERIC, INLINE, TABLE, NWPU)}
+# 默认用「通用」：不假设学校。nwpu 那份只是结构家族里的一个具体样例，排在内置表末尾。
+DEFAULT_LAYOUT_ID = GENERIC.id
 
 
 # ------------------------------------------------------------------------ 注册表

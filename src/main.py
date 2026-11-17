@@ -19,30 +19,31 @@ def _selftest(pdf: str, out_ics: str, report: str) -> int:
     """不开窗口、不依赖控制台输出，把结果写进报告文件（打包成 windowed exe 后
     没有 stdout，只能这样验证）。"""
     import io
-    from timetable import holidays as hol_mod
     from timetable import presets
     from timetable.ics import Config, build_ics, sanity_check_ics
+    from timetable.layout import DEFAULT_LAYOUT_ID, REGISTRY
     from timetable.parser import parse_pdf, verify_parse
 
     lines, code = [], 0
     try:
-        res = parse_pdf(pdf)
+        lay = REGISTRY.get(DEFAULT_LAYOUT_ID)
+        res = parse_pdf(pdf, layout=lay)
         chk = verify_parse(res)
         lines.append("解析记录数: %d" % chk["records"])
         lines.append("解析出的上课次数: %d" % chk["instances"])
         lines.append("时间冲突数: %d" % len(chk["conflicts"]))
         lines.append("学期: %s  姓名: %s" % (res.meta.term, res.meta.name))
 
-        cfg = Config(period_times=presets.get_preset(presets.DEFAULT_PRESET),
+        # 打包自检不联网：节假日用「不处理」，只验证 ICS 生成链路本身
+        cfg = Config(period_times=presets.get_preset(None, lay),
                      class_alarm_min=20, night_summary=True, night_hour=22, night_minute=0,
-                     calendar_name="打包自检",
-                     holidays=hol_mod.DEFAULT_HOLIDAYS,
-                     makeup_days=hol_mod.DEFAULT_MAKEUP_DAYS)
+                     calendar_name="打包自检", layout_id=lay.id)
         text, stats = build_ics(res, cfg)
         with io.open(out_ics, "w", encoding="utf-8", newline="") as f:
             f.write(text)
         st = sanity_check_ics(text)
-        lines.append("节假日: %s" % hol_mod.describe(cfg.holidays, cfg.makeup_days))
+        lines.append("版式: %s（%s）" % (lay.name, lay.entry_mode))
+        lines.append("作息表: %d 节" % len(cfg.period_times))
         lines.append("课程日程: %d" % stats["class_events"])
         lines.append("有效上课次数(已扣除放假): %d" % stats["instances"])
         lines.append("夜间汇总: %d" % stats["night_events"])
@@ -85,16 +86,20 @@ def _selftest(pdf: str, out_ics: str, report: str) -> int:
                     + a._ftr.winfo_reqheight())
             lines.append("布局: 最小 %dx%d 内容需要高 %d" % (mw, mh, need))
             bad = []
-            # 打开时的默认尺寸：应当跟屏幕走，约四分之一屏（宽高各一半）
+            # 打开时的默认尺寸 = 推荐尺寸：按内容算，夹在 [最小尺寸, 屏幕可用] 之间。
+            # （以前要求"面积≈四分之一屏"，那与内容无关；现在检验的是"按内容来"这件事）
             sw, sh = a.winfo_screenwidth(), a.winfo_screenheight()
             dw, dh = a.winfo_width(), a.winfo_height()
-            ratio = float(dw * dh) / float(sw * sh)
-            lines.append("默认窗口: %dx%d（屏幕 %dx%d，占 %.1f%% 面积）"
-                         % (dw, dh, sw, sh, ratio * 100))
-            if not (0.15 <= ratio <= 0.35):
-                bad.append("默认窗口面积占比 %.1f%% 偏离四分之一屏" % (ratio * 100))
+            lines.append("默认窗口: %dx%d（屏幕 %dx%d，内容需要高 %d）"
+                         % (dw, dh, sw, sh, need))
             if dw < mw - 2 or dh < mh - 2:
                 bad.append("默认窗口小于最小尺寸")
+            if dw > sw or dh > sh:
+                bad.append("默认窗口超出屏幕")
+            # 要么把内容显示全，要么已经顶到屏幕上限 —— 不能两头都不占
+            if dh + 2 < need and dh < sh - a.winfo_fpixels("1i") // 2:
+                bad.append("默认高度 %d 既装不下内容(需 %d)也没顶到屏幕上限 %d"
+                           % (dh, need, sh))
             # 最小高度必须明显小于内容高度，否则竖直方向又被锁死了
             if mh > need * 0.75:
                 bad.append("最小高度 %d 太接近内容高 %d，竖直方向会被锁死" % (mh, need))

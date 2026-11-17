@@ -371,7 +371,10 @@ def _parse_detail(text: str, lay: Layout, rx: dict, rest_of: str = "tail"):
     weeks = expand_weeks(int(wm.group("a")),
                          int(wm.group("b")) if wm.groupdict().get("b") else None,
                          wm.groupdict().get("parity"))
-    return dict(weeks=weeks, pfrom=int(pm.group("pfrom")), pto=int(pm.group("pto")),
+    # 单节写法（"3节"）没有结束节次，起止相同 —— 通用版式放开括号后必须支持这个
+    pfrom = int(pm.group("pfrom"))
+    pto = int(pm.group("pto")) if pm.groupdict().get("pto") else pfrom
+    return dict(weeks=weeks, pfrom=pfrom, pto=pto,
                 head=re.sub(r"[\s:：,，、\-]+$", "", text[:head_end]).strip(),
                 rest=re.sub(r"\s+", " ", rest).strip())
 

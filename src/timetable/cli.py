@@ -91,16 +91,15 @@ def _make_parser() -> argparse.ArgumentParser:
                    help="不生成 .ics，只打印程序从 PDF 里看到的结构（列、行、每条正文行的"
                         "切分结果），用来写/调版式")
 
-    h = ap.add_argument_group("节假日")
-    h.add_argument("--holidays", default="on",
-                   help="按法定节假日安排扣除停课并处理调休，on/off（默认 on）")
+    h = ap.add_argument_group("节假日（默认联网获取，带本地缓存）")
+    h.add_argument("--no-holidays", action="store_true",
+                   help="不处理节假日（放假期间也照常排课）。默认会联网获取当年安排。")
     h.add_argument("--holidays-file", default=None,
-                   help="本学期的节假日安排文件（纯文本，格式见 timetable/holidays.py 里的"
-                        " HOLIDAY_FILE_TEMPLATE）；指定后用它替代内置预设")
-    h.add_argument("--fetch-holidays", nargs="?", const="auto", default=None,
-                   metavar="年份",
-                   help="联网获取法定节假日安排（数据源：holiday-cn，按国务院办公厅通知整理）。"
-                        "不填年份就按「第 1 周周一 + 总周次」自动推；也可写 2026,2027")
+                   help="改用本地节假日文件（纯文本，格式见 timetable/holidays.py 的"
+                        " HOLIDAY_FILE_TEMPLATE）。指定它就不再联网")
+    h.add_argument("--holidays-years", default=None, metavar="年份",
+                   help="指定要取哪几个自然年（如 2026 或 2026,2027）；不写就按"
+                        "「第 1 周周一 + 总周次」自动推断学期跨了哪几年")
     h.add_argument("--holidays-url", default=None,
                    help="换数据源地址（要含 {year} 占位，支持 https:// 与 file:///，"
                         "内网镜像/离线包用）")
@@ -262,12 +261,13 @@ def main(argv=None) -> int:
             print("错误：--night 需要 HH:MM 或 off", file=sys.stderr)
             return 2
 
-    # ---- 节假日 ----
-    use_holidays = str(args.holidays).strip().lower() not in (
-        "off", "no", "none", "关闭", "0")
-    holiday_list = list(hol_mod.DEFAULT_HOLIDAYS) if use_holidays else []
-    makeup_list = list(hol_mod.DEFAULT_MAKEUP_DAYS) if use_holidays else []
-    holidays_src = "内置预设" if use_holidays else "未启用"
+    # ---- 节假日：默认联网获取（带本地缓存），取不到就降级、不中止 ----
+    # 设计要点：节假日缺失只会「少扣几天假」，不该让整个日历出不来。所以联网失败时
+    # 只警告 + 继续生成（退出码仍为 0）。真正不可用的场景（内网/离线）用
+    # --holidays-file 兜底；--holidays-url 可指向内网镜像或 file:/// 离线包。
+    use_holidays = not args.no_holidays
+    holiday_list, makeup_list = [], []
+    holidays_src = "未启用"
     if args.holidays_file:
         try:
             holiday_list, makeup_list = hol_mod.load_holiday_file(args.holidays_file)
@@ -276,19 +276,19 @@ def main(argv=None) -> int:
             return 2
         holidays_src = "文件 %s" % os.path.basename(args.holidays_file)
         log("已读取节假日文件：%s" % args.holidays_file)
-    if args.fetch_holidays is not None:
+    elif use_holidays:
         from .holiday_fetch import HolidayFetchError, fetch_year, holidays_for_range
         weeks = [w for r in result.records for w in r.all_weeks()]
         max_week = max(weeks) if weeks else 19
-        spec = (args.fetch_holidays or "auto").strip()
+        spec = (args.holidays_years or "auto").strip()
         try:
             if spec.lower() in ("auto", "", "学期"):
-                span = (week1, week1 + dt.timedelta(weeks=max_week) - dt.timedelta(days=1))
-                yh = holidays_for_range(span[0], span[1],
+                span_end = week1 + dt.timedelta(weeks=max_week) - dt.timedelta(days=1)
+                yh = holidays_for_range(week1, span_end,
                                         url_template=args.holidays_url,
                                         use_cache=not args.holidays_refresh)
                 log("联网获取节假日：按学期 %s ~ %s 推到年份 %s"
-                    % (span[0], span[1], "、".join(str(y) for y in yh.years)))
+                    % (week1, span_end, "、".join(str(y) for y in yh.years)))
             else:
                 parts = [p.strip() for p in spec.replace("，", ",").split(",") if p.strip()]
                 if len(parts) == 1:
@@ -302,28 +302,35 @@ def main(argv=None) -> int:
                                             use_cache=not args.holidays_refresh)
                 log("联网获取节假日：%s 年" % "、".join(str(y) for y in yh.years))
         except ValueError:
-            print("错误：--fetch-holidays 要写年份（如 2026）或 2026,2027，或干脆不填值"
-                  "（按学期自动推）", file=sys.stderr)
+            print("错误：--holidays-years 要写年份（如 2026）或 2026,2027，"
+                  "或干脆不写（按学期自动推）", file=sys.stderr)
             return 2
         except HolidayFetchError as exc:
+            # 关键：不中止。把可操作的说明整段打到 stderr，然后当作「本次不处理节假日」
             print(str(exc), file=sys.stderr)
-            return 3
-        holiday_list, makeup_list = yh.holidays, yh.makeup_days
-        holidays_src = "联网（%s）" % "、".join(str(y) for y in yh.years)
-        for line in yh.describe().splitlines()[1:]:
-            log("    " + line)
-        if yh.from_cache and args.holidays_url:
-            # 缓存只按年份存，不记"这份数据是哪个镜像来的"。换了 --holidays-url 却命中
-            # 旧缓存的话，用户会以为新镜像生效了。明确说一句，并给出强制重取的办法。
-            log("    注意：这次用的是本地缓存，不是 %s 现取的数据。想让它真正生效，"
-                "加 --holidays-refresh 重新联网。" % args.holidays_url)
-        if args.save_holidays:
-            from .holiday_fetch import to_holiday_file_text
-            with io.open(args.save_holidays, "w", encoding="utf-8") as f:
-                f.write(to_holiday_file_text(yh))
-            log("已把这批节假日写成可编辑文件：%s（学校自己调课时改这份，"
-                "以后用 --holidays-file 指它）" % args.save_holidays)
-        use_holidays = True
+            print("", file=sys.stderr)
+            print("→ 本次仍会生成日历，但不会扣除任何节假日（放假当天的课会被排上）。",
+                  file=sys.stderr)
+            yh = None
+        if yh is None:
+            holidays_src = "未取到（已降级为不处理）"
+            use_holidays = False
+        else:
+            holiday_list, makeup_list = yh.holidays, yh.makeup_days
+            holidays_src = "联网（%s）" % "、".join(str(y) for y in yh.years)
+            for line in yh.describe().splitlines()[1:]:
+                log("    " + line)
+            if yh.from_cache and args.holidays_url:
+                # 缓存只按年份存，不记"这份数据是哪个镜像来的"。换了 --holidays-url 却命中
+                # 旧缓存的话，用户会以为新镜像生效了。明确说一句，并给出强制重取的办法。
+                log("    注意：这次用的是本地缓存，不是 %s 现取的数据。想让它真正生效，"
+                    "加 --holidays-refresh 重新联网。" % args.holidays_url)
+            if args.save_holidays:
+                from .holiday_fetch import to_holiday_file_text
+                with io.open(args.save_holidays, "w", encoding="utf-8") as f:
+                    f.write(to_holiday_file_text(yh))
+                log("已把这批节假日写成可编辑文件：%s（学校自己调课时改这份，"
+                    "以后用 --holidays-file 指它）" % args.save_holidays)
 
     cfg = Config(
         week1_monday=week1,
@@ -354,9 +361,11 @@ def main(argv=None) -> int:
             if f.level == "error":
                 print("  " + str(f), file=sys.stderr)
         return 3
-    if use_holidays or args.holidays_file or args.fetch_holidays:
+    if use_holidays or args.holidays_file:
         log("节假日（来源：%s）：" % holidays_src
             + hol_mod.describe(holiday_list, makeup_list))
+    elif not args.no_holidays:
+        log("节假日：本次未处理（见上面的原因）—— 放假当天的课会被排进日历。")
 
     try:
         text, stats = build_ics(result, cfg)
