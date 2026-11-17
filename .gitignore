@@ -1,0 +1,57 @@
+# ---------------------------------------------------------------- 个人课表数据
+# 这门工具吃的输入就是「你的课表 + 姓名 + 学号」，绝对不该进仓库。
+# 要带示例课表：命名成 sample-timetable.pdf 放项目根目录（构建脚本会自动复制进产物）。
+课表.pdf
+*.课表.pdf
+sample-timetable.pdf
+# 从别人那里拿来的真实课表，一律用这个名字丢在根目录做本地调试
+real-*.pdf
+
+# 生成出来的日历（内容是个人课表）
+*.ics
+
+# 解析调试产物
+*-dump.txt
+*-dump.log
+uitest*.txt
+pathcheck*.txt
+report.txt
+selftest-report.txt
+holiday-*.txt
+!assets/*.txt
+
+# 界面验证截图（--shot 与 tools/ 下的回归脚本产生的）
+/*.png
+/*.jpg
+shots/
+
+# ---------------------------------------------------------------- Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------------------------------------------------------------- 构建产物
+/build/
+/dist/
+/TimetableToCalendar.spec
+TimetableToCalendar.spec
+
+# ---------------------------------------------------------------- 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ---------------------------------------------------------------- 本地约定
+# 各自的调试脚本、临时版式配置放这里，不进仓库
+/local/
+*.local.json
+notes.md
