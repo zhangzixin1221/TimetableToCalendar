@@ -97,11 +97,11 @@ def _make_parser() -> argparse.ArgumentParser:
     g.add_argument("--dump-layout", action="store_true",
                    help="不生成 .ics，只打印程序从 PDF 里看到的结构（列、行、每条正文行的"
                         "切分结果），用来写/调版式")
-    cg = ap.add_argument_group("OCR 交叉验证（用像素复核文字层的字）")
-    cg.add_argument("--crosscheck", choices=["auto", "on", "off"], default="auto",
-                    help="auto（默认）= 仅当文字层露出可疑迹象时才用 OCR 复核"
-                         "（出现康熙部首/部首补充区字符、cid: 或替换符）；"
-                         "on=总是复核；off=不复核。单页约 5~15 秒")
+    cg = ap.add_argument_group("OCR 交叉验证（每份课表都用像素复核文字层）")
+    cg.add_argument("--crosscheck", choices=["on", "auto", "off"], default="on",
+                    help="on（默认）= 每份课表都用 OCR 复核一遍文字层；"
+                         "auto = 只在文字层露出可疑迹象时才复核；off = 不复核。"
+                         "单页约 5~15 秒")
 
     h = ap.add_argument_group("节假日（默认联网获取，带本地缓存）")
     h.add_argument("--no-holidays", action="store_true",
@@ -274,10 +274,17 @@ def main(argv=None) -> int:
         print("解析失败：%s" % exc, file=sys.stderr)
         return 1
 
-    # ---- OCR 交叉验证：用像素复核文字层的字 ----
-    # 只在「文字层看起来可疑」时自动跑（--crosscheck auto）：健康 PDF 的文字层
-    # 就是原文，跑它只是白等 5~15 秒。
-    if not is_table:
+    # ---- OCR 交叉验证：每份课表都用像素复核文字层 ----
+    # 默认总是跑（--crosscheck on）：文字层可能"看着对、码位错"（假汉字/乱码），
+    # 只有像素能作证。想要快就用 --crosscheck auto（仅可疑时）或 off。
+    if is_table:
+        log("OCR 复核：跳过（Excel/CSV 是结构化输入，没有「文字层」这一环，"
+            "单元格本身就是确定的）")
+    elif args.pdf and (is_image_file(args.pdf)
+                       or not pdf_has_text_layer(args.pdf)):
+        log("OCR 复核：跳过（这份输入本身就是用 OCR 认出来的，再认一遍没有意义；"
+            "识别结果仍需你核对）")
+    else:
         from . import crosscheck as xcheck
         xcheck.run_if_needed(args.pdf, result, lay,
                              mode=args.crosscheck, log=log)

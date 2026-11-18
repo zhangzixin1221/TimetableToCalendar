@@ -129,14 +129,31 @@ else:
 
     os.remove(fake)
 
-print("\n[4] 健康 PDF 上 mode=auto 不应该白跑 OCR")
+print("\n[4] 默认「每份都复核」的行为")
 healthy = os.path.join(ROOT, "fixtures", "nwpu-sample.pdf")
 if os.path.isfile(healthy) and ok:
     lay = REGISTRY.get("generic")
     res = parse_pdf(healthy, layout=lay, period_times=presets.get_preset(None, lay))
-    need, _ = cc.suspicion(res.stats.get("text_layer"))
-    check("健康 fixture 不被判为可疑（auto 会跳过）", need is False,
-          res.stats.get("text_layer"))
+    # 默认模式是 on：即使文字层毫无可疑迹象，也要跑一遍复核（用户要求「不论什么课表都验」）
+    rep_on = cc.run_if_needed(healthy, res, lay, mode="on", log=None)
+    check("mode=on 时健康课表也会复核（默认行为）",
+          rep_on.get("checked") is True, rep_on.get("reasons"))
+    check("健康课表复核结果应当是「一致」（不能天天报假警）",
+          not rep_on.get("diffs") and (rep_on.get("agree") or 0) >= 0.9,
+          "agree=%s diffs=%d" % (rep_on.get("agree"), len(rep_on.get("diffs") or [])))
+    # auto 仍然保留：健康课表下会跳过（想快的人用）
+    res2 = parse_pdf(healthy, layout=lay, period_times=presets.get_preset(None, lay))
+    rep_auto = cc.run_if_needed(healthy, res2, lay, mode="auto", log=None)
+    check("mode=auto 时健康课表跳过复核（省时间）",
+          rep_auto.get("checked") is False, rep_auto.get("reasons"))
+
+print("\n[5] 切行差异不算字符错误（否则 always-on 会天天报警）")
+check("一方是另一方的子串 → 判为切行差异（OCR 截断了）",
+      cc._looks_like_split("学院：航海学院", "航海学院"))
+check("长度相当但字不同 → 判为真差异",
+      not cc._looks_like_split("(1~16周)", "(1~18周)"))
+check("内容完全不同的长串 → 判为真差异（不能因为长度差大就放过）",
+      not cc._looks_like_split("大学物理", "马克思主义学院"))
 
 print("\n" + "=" * 74)
 print("%d 项检查，%s" % (checks, "全部通过" if ok_all else "存在失败项"))

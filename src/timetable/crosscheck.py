@@ -105,23 +105,47 @@ def _similar(a: str, b: str) -> float:
     return hit / max(len(a), len(b))
 
 
-def _spans_inside(spans: List[dict], box) -> str:
-    """把中心落在 OCR 框里的文字层 span 按 x 顺序拼起来。
+def _spans_inside(spans: List[dict], box, min_cover: float = 0.5) -> str:
+    """把**被 OCR 框覆盖了大半**的文字层 span 按 x 顺序拼起来。
 
-    以**OCR 框为单位**取文字，而不是先把文字层切成行再找 OCR 框：
-    文字层被切成一堆碎片 span，而 OCR 返回的是它自己认为的一个文字块，
-    用 OCR 的框当"容器"最不容易出错。
-    （第一版按基线给整页 span 分行，忘了先分列 —— 一"行"横跨七个星期列，
-    和 OCR 的列内框对不上，健康的课表也报 60 多处不一致。）
+    以 OCR 框为单位取文字，而不是先把文字层切成行再找 OCR 框：文字层是碎片 span，
+    OCR 返回的是它自己认为的一个文字块，用 OCR 的框当"容器"最不容易出错。
+
+    判据用**覆盖率**而不是"中心落在框内"：OCR 的框常常只框住一行的前半截
+    （实测 `(1~16周)(5-6节)` 里的节次部分跑到框外），按中心判定就会把框外的节次
+    也算进来，于是"文字层有节次、OCR 没有"这种假差异天天出现。
     """
     inside = []
     for s in spans:
-        cx = (s["x0"] + s["x1"]) / 2.0
-        cy = (s["y0"] + s["y1"]) / 2.0
-        if box[0] - 1 <= cx <= box[2] + 1 and box[1] - 1 <= cy <= box[3] + 1:
+        sx0, sy0, sx1, sy1 = s["x0"], s["y0"], s["x1"], s["y1"]
+        area = max(1e-6, (sx1 - sx0) * (sy1 - sy0))
+        ix0, iy0 = max(sx0, box[0]), max(sy0, box[1])
+        ix1, iy1 = min(sx1, box[2]), min(sy1, box[3])
+        if ix1 <= ix0 or iy1 <= iy0:
+            continue
+        if (ix1 - ix0) * (iy1 - iy0) / area >= min_cover:
             inside.append(s)
     inside.sort(key=lambda z: z["x0"])
     return "".join(s["text"] for s in inside)
+
+
+def _looks_like_split(tl_text: str, ocr_text: str) -> bool:
+    """这一处差异是不是**只是切行不同**（OCR 把一个框切成了别的边界）。
+
+    为什么需要：OCR 的框边界和文字层的 span 边界不可能总一致 ——
+    实测 `学院：航海学院`（文字层一行）会被 OCR 报成 `航海学院`，
+    相似度 57%、置信度 80%，看着像"不一致"，其实文字层是对的。
+    开启「每次都复核」之后这种假差异会天天报警，用户很快就会无视所有警告。
+
+    判据：**一方是另一方的子串**才算切行（OCR 截断了、或把两行并了）。
+    不能用"长度差得多"代替：那会把 `大学物理` vs `马克思主义学院` 这种真正的
+    严重不一致也放过（长度差确实大，但内容完全不同）。
+    """
+    a = normalize_text(_clean(tl_text), aggressive=True).replace(" ", "")
+    b = normalize_text(_clean(ocr_text), aggressive=True).replace(" ", "")
+    if not a or not b:
+        return True
+    return a in b or b in a
 
 
 def crosscheck(pdf_path: str, lay=None, log=None,
@@ -152,6 +176,8 @@ def crosscheck(pdf_path: str, lay=None, log=None,
             page_spans = _collect_spans(doc[pno])
             if not page_spans:
                 continue
+            if log:
+                log("  复核第 %d/%d 页…" % (pno + 1, doc.page_count))
             pix = page.get_pixmap(dpi=dpi)
             tmp = os.path.join(os.environ.get("TEMP", "."),
                                "_tt-crosscheck-%d-%d.png" % (os.getpid(), pno))
@@ -188,6 +214,10 @@ def crosscheck(pdf_path: str, lay=None, log=None,
                 if conf < MIN_CONF:
                     report["inconclusive"] = report.get("inconclusive", 0) + 1
                     continue
+                # 只是 OCR 切行不同（长度差太多）→ 不算字符错误，也别去打扰用户
+                if _looks_like_split(tl_text, o["text"]):
+                    report["split_only"] = report.get("split_only", 0) + 1
+                    continue
                 if len(report["diffs"]) < max_report:
                     report["diffs"].append(dict(
                         page=pno + 1, text_layer=_clean(tl_text),
@@ -213,16 +243,14 @@ def run_if_needed(pdf_path: str, result, lay=None, mode: str = "auto",
         return {"checked": False, "reasons": ["按 --crosscheck off 关闭"], "diffs": []}
     health = (result.stats or {}).get("text_layer") or {}
     need, reasons = suspicion(health)
-    if not need and mode != "on":
-        return {"checked": False, "reasons": ["文字层未露出可疑迹象"]}
+    if mode == "auto" and not need:
+        return {"checked": False, "reasons": ["文字层未露出可疑迹象（auto 模式跳过）"]}
     say = log or (lambda m: None)
     say("")
+    say("用 OCR 复核文字层（文字层负责排版，OCR 只核对每个字对不对）…")
     if need:
-        say("文字层看起来可疑，用 OCR 复核一遍（文字层仍负责排版，OCR 只核对字）：")
         for r in reasons:
-            say("  · " + r)
-    else:
-        say("按「总是复核」用 OCR 核对一遍文字层…")
+            say("  · 可疑迹象：" + r)
     rep = crosscheck(pdf_path, lay, log=log)
     rep["reasons"] = reasons
     for line in describe(rep):
@@ -249,6 +277,9 @@ def describe(report: dict) -> List[str]:
     diffs = report.get("diffs") or []
     if not diffs:
         out.append("  ✓ 文字层与 OCR 读数一致，未发现可疑字符")
+        if report.get("split_only"):
+            out.append("  （另有 %d 处只是 OCR 的切行方式不同，不算字符差异）"
+                       % report["split_only"])
         return out
     out.append("  ⚠ 有 %d 处两边读数不一致，请核对（左=文字层，右=OCR 看到的样子）："
                % (len(diffs) + report.get("diffs_truncated", 0)))

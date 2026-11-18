@@ -425,7 +425,7 @@ class App(tk.Tk):
                                                 padx=(ui.SPACE["xs"], 0))
         mk(w, "（导出的结果改完可直接当课表文件选中）", small=True).pack(
             side="left", padx=(ui.SPACE["sm"], 0))
-        ui.Switch(w, text="可疑文字层用 OCR 复核", variable=self.var_crosscheck).pack(
+        ui.Switch(w, text="每次都用 OCR 复核文字层", variable=self.var_crosscheck).pack(
             side="left", padx=(ui.SPACE["md"], 0))
 
         # ---- 提示行 ----
@@ -1134,10 +1134,13 @@ class App(tk.Tk):
                 if self.var_crosscheck.get():
                     try:
                         from . import crosscheck as xcheck
+                        # mode="on"：每份课表都复核，不设"可疑才跑"的门槛
                         xcheck.run_if_needed(pdf, self.result, self.layout,
-                                             mode="auto", log=self.log)
+                                             mode="on", log=self.log)
                     except Exception as exc:               # noqa: BLE001
                         self.log("（OCR 复核没能完成：%s —— 不影响解析结果）" % exc)
+                else:
+                    self.log("（已关闭 OCR 复核）")
         except XlsxError as exc:
             self.log("Excel 有问题：%s" % exc)
             self._set_status("Excel 有问题", "err")
