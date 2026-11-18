@@ -276,7 +276,7 @@ class HeaderPanel : Panel
         TextRenderer.DrawText(g, "课表转日历", Theme.F(17f, true),
             new Rectangle(Theme.S(36), Theme.S(22), r.Width - Theme.S(56), Theme.S(32)),
             Color.White, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
-        TextRenderer.DrawText(g, "把教务系统的课表 PDF 转成可导入手机日历的 .ics",
+        TextRenderer.DrawText(g, "把教务系统课表（PDF / Excel / 图片）转成可导入手机日历的 .ics",
             Theme.F(9f),
             new Rectangle(Theme.S(38), Theme.S(56), r.Width - Theme.S(66), Theme.S(24)),
             Theme.OnNavy2, TextFormatFlags.Left);
@@ -780,7 +780,7 @@ static class Program
             Type lt = lnk.GetType();
             SetProp(lt, lnk, "TargetPath",       targetExe);
             SetProp(lt, lnk, "WorkingDirectory", workDir);
-            SetProp(lt, lnk, "Description",      "把课表 PDF 转成可导入手机日历的 .ics");
+            SetProp(lt, lnk, "Description",      "把课表（PDF / Excel / 图片）转成可导入手机日历的 .ics");
             SetProp(lt, lnk, "IconLocation",     targetExe + ",0");
             lt.InvokeMember("Save", BindingFlags.InvokeMethod, null, lnk, null);
         }

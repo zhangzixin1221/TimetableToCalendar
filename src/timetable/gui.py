@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""图形界面：选择课表 PDF → 解析 → 预览/修改 → 生成 .ics。
+"""图形界面：选择课表（PDF / Excel / 图片）→ 解析 → 预览/修改 → 生成 .ics。
 
 界面用 ui_kit 里的自绘组件做成现代扁平风格（深色标题带 + 白色卡片 + 圆角按钮）。
 
@@ -73,7 +73,7 @@ class App(tk.Tk):
         ui.enable_dpi_awareness()
         super().__init__()
         ui.init_theme(self)
-        self.title("课表 PDF → 手机日历")
+        self.title("课表 → 手机日历")
         # 初始尺寸先给一个保守值，真正的尺寸在 _apply_minsize() 里按屏幕大小算
         # （默认取屏幕宽高各一半，也就是大约占屏幕面积的四分之一）。
         _w, _h = ui.fit_size(self, ui.px(900), ui.px(600))
@@ -113,7 +113,7 @@ class App(tk.Tk):
         self.var_holiday_notice = tk.BooleanVar(value=True)
         self.var_hol_years = tk.StringVar(value="")          # 空 = 按学期自动推年份
         self.var_holiday_hint = tk.StringVar()
-        self.var_footer = tk.StringVar(value="选择课表 PDF，然后点右下角「解析课表」。")
+        self.var_footer = tk.StringVar(value="选择课表文件（PDF / Excel / 图片），然后点右下角「解析课表」。")
         self._log_lines = 5      # 日志行数，屏幕太矮时自动让位给预览表
         self._need_h = 0         # 完整布局所需的窗口高度（自然尺寸）
 
@@ -128,8 +128,9 @@ class App(tk.Tk):
         # 否则 expand=True 的中间区会先吃掉全部高度，把底栏挤成 1x1。
         self._hdr = ui.Header(
             self,
-            title="课表 PDF → 手机日历",
-            subtitle="把教务系统的课表转成带提醒的 .ics，可导入 iPhone / iPad / Mac / Android 日历",
+            title="课表 → 手机日历",
+            subtitle="把教务系统课表（PDF / Excel / 图片）转成带提醒的 .ics，"
+                     "可导入 iPhone / iPad / Mac / Android 日历",
             right_factory=self._build_header_right,
         )
         self._hdr.pack(fill="x")
@@ -240,17 +241,18 @@ class App(tk.Tk):
         return "break"
 
     def _apply_minsize(self):
-        """决定「最小尺寸」和「打开时的推荐尺寸」。
+        """决定「最小尺寸」和「打开时的默认尺寸」。
 
-        三条经验（都踩过）：
+        经验（都踩过）：
         1. 最小尺寸不能按「内容完整可见」来定（那会把竖直方向锁死：内容要 1823 物理像素，
            而屏幕可用高度只有 1879，能拖的范围只剩 56 像素）。最小尺寸只保证顶栏、底栏、
            预览表各留一点可见高度，装不下的部分交给滚动条。
-        2. 默认尺寸不用「屏幕的一半」这种拍脑袋的算法：它和内容无关，内容少时窗口空一大片、
-           内容多时一开窗就得滚。这里按**内容实际需要的尺寸**加余量来算，再夹到
-           [最小尺寸, 屏幕×0.85] 之间。
-        3. 算出来的推荐尺寸必须是**能一次看到完整内容**的（在这个尺寸下不该有滚动条），
-           否则「推荐」二字没有意义 —— 所以算完还要复核一次并向上补足。
+        2. 默认尺寸按**内容实际需要**给，但**封顶在屏幕的一半多一点**（宽 55%、高 60%）。
+           曾经按「尽量一次装下全部内容」算：配置卡长到 4 行后内容高 1975px，
+           默认窗口几乎铺满整屏，用户反馈太大。装不下的部分靠滚动条 ——
+           这是既有能力（resize 回归专门钉过"窗口变大内容不许变小、底部必须可达"），
+           不值得为省一次滚动把窗口撑到全屏。
+        3. 内容比封顶还小时（比如以后精简了界面），默认就按内容给，不会空一大片。
         """
         try:
             self.update_idletasks()
@@ -265,15 +267,11 @@ class App(tk.Tk):
             need_w = int(self._inner.winfo_reqwidth()) + ui.px(2 * 16)
             need_h = self._need_h + hdr_h + ftr_h + ui.px(8)
 
-            # 上限跟屏幕可用区域走（留出任务栏/标题栏），下限是最小尺寸。
-            # 注意：内容本身比屏幕还高时**必然**会有滚动条，那不是算错 —— 所以推荐尺寸
-            # 的含义是「能一次显示多少就显示多少」，而不是"保证不用滚"。
-            cap_w = int(sw - ui.px(32))
-            cap_h = int(sh - ui.px(48))
+            # 封顶：屏幕的一半多一点，同时留出任务栏/边框
+            cap_w = min(int(sw * 0.55), sw - ui.px(24))
+            cap_h = min(int(sh * 0.60), sh - ui.px(24))
             w = max(int(min_w), min(need_w, cap_w))
             h = max(int(min_h), min(need_h, cap_h))
-            # 保证推荐尺寸下内容高度真的装得下（留一点余量吸收取整/字体差异）
-            h = max(h, min(need_h + ui.px(6), cap_h))
             w, h = ui.fit_size(self, w, h, margin=16)
             self.geometry("%dx%d" % (w, h))
             self.update_idletasks()
@@ -311,7 +309,7 @@ class App(tk.Tk):
         top = tk.Frame(root, bg=P["card"])
         top.pack(fill="x")
         top.columnconfigure(1, weight=1)
-        mk(top, "课表 PDF").grid(row=0, column=0, sticky="w", padx=(0, ui.SPACE["md"]))
+        mk(top, "课表文件").grid(row=0, column=0, sticky="w", padx=(0, ui.SPACE["md"]))
         ui.RoundedInput(top, textvariable=self.var_pdf,
                         width=ui.px(420)).grid(row=0, column=1, sticky="ew")
         ui.RoundedButton(top, text="浏览…", kind="secondary", height=ui.px(32),
@@ -1093,7 +1091,7 @@ class App(tk.Tk):
     def do_parse(self):
         pdf = self.var_pdf.get().strip()
         if not pdf:
-            self._warn("提示", "请先选择课表 PDF。")
+            self._warn("提示", "请先选择课表文件（PDF / Excel / 图片）。")
             return False
         if not os.path.isfile(pdf):
             self._error("错误", "找不到文件：\n%s" % pdf)

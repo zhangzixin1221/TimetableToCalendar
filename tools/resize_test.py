@@ -46,33 +46,58 @@ if minh > need_h * 0.75:
 else:
     print("竖直方向可自由缩放：最小 %d < 内容自然高 %d" % (minh, need_h))
 
-# 打开时的默认尺寸 = **推荐尺寸**：按内容实际需要来定，再夹到 [最小尺寸, 屏幕可用]。
-# （以前这里要求「面积≈四分之一屏」，那是个与内容无关的拍脑袋算法：内容少时窗口空一大片，
-#   内容多时一开窗就得滚。现在改为检验三条真正有意义的契约。）
+# 打开时的默认尺寸：按内容需要给，但**封顶在屏幕的一半多一点**（宽 55% / 高 60%）。
+# 历史：更早是「面积≈四分之一屏」（与内容无关，内容多时一开窗就滚）；后来改成
+# 「尽量装下全部内容」—— 配置卡长到 4 行后内容高 1975px，默认窗口几乎铺满整屏，
+# 用户明确反馈太大。现在是第三条：按内容算但封顶，装不下的部分交给滚动条
+# （滚动条这条路 resize 回归一直钉着：内容不许被裁、必须能滚到底）。
 screen_w, screen_h = app.winfo_screenwidth(), app.winfo_screenheight()
 sw, sh = app.winfo_width(), app.winfo_height()
 need_h = app._inner.winfo_reqheight() + app._hdr.winfo_reqheight() + app._ftr.winfo_reqheight()
-print("默认窗口 %dx%d（屏幕 %dx%d）内容需要高 %d，占比 %.1f%%"
-      % (sw, sh, screen_w, screen_h, need_h, 100.0 * sh / screen_h))
+cap_w = min(int(screen_w * 0.55), screen_w - app.winfo_fpixels("1i") // 6)
+cap_h = min(int(screen_h * 0.60), screen_h - app.winfo_fpixels("1i") // 6)
+print("默认窗口 %dx%d（屏幕 %dx%d，封顶 %dx%d）内容需要高 %d，占屏高 %.1f%%"
+      % (sw, sh, screen_w, screen_h, cap_w, cap_h, need_h, 100.0 * sh / screen_h))
 problems = []
 # (1) 不许小于最小尺寸，也不许超出屏幕
 if sw < minw - 2 or sh < minh - 2:
     problems.append("默认尺寸小于最小尺寸")
 if sw > screen_w or sh > screen_h:
     problems.append("默认尺寸超出屏幕")
-# (2) 推荐尺寸必须尽量把内容显示全：要么装得下内容，要么已经顶到屏幕上限
-if sh + 2 < need_h and sh < screen_h - app.winfo_fpixels("1i") // 2:
-    problems.append("内容高 %d，窗口高 %d：既没装下内容也没顶到屏幕上限"
+# (2) 必须**封顶在屏幕的一半多一点** —— 这是用户明确要求的"别太大"
+if sw > cap_w + 4:
+    problems.append("默认宽度 %d 超过封顶 %d（屏幕 %.0f%%）"
+                    % (sw, cap_w, 55))
+if sh > cap_h + 4:
+    problems.append("默认高度 %d 超过封顶 %d（屏幕 %.0f%%）"
+                    % (sh, cap_h, 60))
+# (3) 内容比封顶小时，窗口应当按内容给（不能反而撑到封顶、空一大片）
+if need_h + 2 < cap_h and sh > need_h + app.winfo_fpixels("1i") // 3:
+    problems.append("内容只需 %d，窗口却给到 %d（空太多，应按内容给）"
                     % (need_h, sh))
-# (3) 宽度必须够，不能一开窗就因为窄而把表格右列裁掉
-if sw < app._inner.winfo_reqwidth():
-    problems.append("窗口宽 %d 小于内容需要宽 %d" % (sw, app._inner.winfo_reqwidth()))
+# (4) 宽度：**任何一列都不许被裁掉**。判据看行为，不看公式：
+#     Treeview 不会自动压缩列宽，宽度之和超过控件宽时右边的列直接被裁 ——
+#     好在这里有 _fit_columns：先按比例压到各列最小值，再塞不下就显示横向滚动条。
+#     所以合格条件是「所有列宽之和 ≤ 表格宽」或「横向滚动条已显示」。
+col_sum = sum(int(app.tree.column(c, "width")) for c in app.tree["columns"])
+tree_w = app.tree.winfo_width()
+hs = bool(getattr(app, "_hs_shown", False))
+print("      表格宽 %d，列宽之和 %d，横向滚动条 %s"
+      % (tree_w, col_sum, "显示" if hs else "隐藏"))
+if col_sum > tree_w + 2 and not hs:
+    problems.append("列宽之和 %d 超过表格宽 %d 却没有横向滚动条（右边列会被裁）"
+                    % (col_sum, tree_w))
+# 宽度也不能小到连各列最小值都放不下又不给横向滚动条
+total_min = sum(ui.px(v) for v in app._col_min.values())
+if tree_w < total_min - 2 and not hs:
+    problems.append("表格宽 %d 小于各列最小值之和 %d，且没有横向滚动条"
+                    % (tree_w, total_min))
 if problems:
     for p in problems:
         print("!! " + p)
     bad += len(problems)
 else:
-    print("    推荐尺寸合适：按内容算、夹在 [最小尺寸, 屏幕] 之间")
+    print("    默认尺寸合适：按内容算、封顶在屏幕的 55%%×60%% 以内")
 
 
 def find_cards(w, out=None):

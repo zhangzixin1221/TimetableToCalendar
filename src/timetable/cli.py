@@ -52,7 +52,7 @@ def _periods_from_arg(spec: str):
 
 def _make_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        prog="timetable", description="把教务系统课表 PDF 转成可导入手机日历的 .ics")
+        prog="timetable", description="把教务系统课表（PDF / Excel / 图片）转成可导入手机日历的 .ics")
     ap.add_argument("pdf", nargs="?",
                     help="课表文件：PDF（有文字层）或 Excel/CSV（.xlsx/.csv）")
     ap.add_argument("-o", "--out", help="输出 .ics 路径（默认与输入同名）")

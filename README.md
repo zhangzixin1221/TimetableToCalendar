@@ -1,22 +1,24 @@
-# 课表 PDF → 手机日历（.ics）
+# 课表 → 手机日历（.ics）
 
-把**教务系统导出的《学生课表》PDF**，转成可以直接导入 iPhone / iPad / Mac /
-Android 日历的 `.ics` 文件，并自动加上两类提醒：
+把**教务系统的课表**转成可以直接导入 iPhone / iPad / Mac / Android 日历的 `.ics`
+文件。三种输入任选：**PDF**（教务系统导出/网页打印）、**Excel/CSV**（一行一条课，
+最确定）、**图片/扫描件**（本地 OCR 识别后核对）。并自动加上两类提醒：
 
 1. **每节课提前 N 分钟提醒**（默认 20 分钟）
 2. **每晚固定时间汇总第二天要上的所有课**（默认 22:00）
 
 还会按**法定节假日**停课（用 iCalendar 的 `EXDATE` 从循环里精确剔除），并处理**调休**
-（节假日安排可以**联网按年份自动获取**，也可以自己填）。
+（节假日安排**默认联网按年份自动获取**，取不到不拦生成，也可以自己填）。
 
-内置一套**西北工业大学**的课表版式（开箱即用）；别的学校/别的教务系统靠
-「版式」适配 —— 不用改代码，选一个版式或写一份 JSON 配置即可，见
+不绑定任何一所学校：默认用「通用版式」自动判断结构，对不上就换版式或写一份
+JSON 配置，不用改代码；PDF 有文字层时还会**默认用 OCR 交叉验证每个字**
+（网页打印的 PDF 常有"看着对、码位错"的假汉字）。见
 [换学校 / 换教务系统](#换学校--换教务系统版式)。
 
-> Turn a course-timetable PDF (NWPU out of the box, other schools via a pluggable
-> *layout*) into an `.ics` calendar with per-class reminders, a nightly
-> "tomorrow's classes" summary, Chinese public-holiday handling — online or manual —
-> and a one-file Windows installer.
+> Turn a course timetable (PDF, Excel/CSV, or even a photo — with OCR cross-check
+> of the PDF text layer) into an `.ics` calendar with per-class reminders, a
+> nightly "tomorrow's classes" summary, Chinese public holidays fetched online by
+> year, school-agnostic pluggable *layouts*, and a one-file Windows installer.
 
 界面是中文的，程序跑起来不需要 Python。
 
@@ -24,7 +26,8 @@ Android 日历的 `.ics` 文件，并自动加上两类提醒：
 
 ## 下载与安装
 
-到 [Releases](../../releases) 下载 **`TimetableToCalendar-Setup.exe`**（约 28 MB），双击安装。
+到 [Releases](../../releases) 下载 **`TimetableToCalendar-Setup.exe`**（约 97 MB，含本地
+OCR 引擎与模型），双击安装。
 
 - 默认装到 `D:\Tools\TimetableToCalendar`（没有 D 盘时用
   `%LOCALAPPDATA%\Programs\TimetableToCalendar`）
@@ -39,7 +42,7 @@ Android 日历的 `.ics` 文件，并自动加上两类提醒：
 
 双击 `TimetableToCalendar.exe`，然后：
 
-1. 「课表 PDF」选你的课表，「输出 .ics」会自动填好
+1. 「课表文件」选你的课表（PDF / Excel / CSV / 图片都行），「输出 .ics」会自动填好
 2. **确认「第 1 周周一」的日期**（最关键的一步，见下文）
 3. 点「解析课表」
 4. 对着预览表核对一遍（有错的直接双击那一行改）
@@ -490,9 +493,10 @@ dist\TimetableToCalendar-Setup.exe --pathcheck path.txt # 安装位置规范化�
 卸载时如果那个父目录是安装时新建的、而且空了，会一并删掉，不留空文件夹。
 
 **程序窗口能调整大小吗？**
-能，横竖都能拖。默认约占屏幕四分之一；拉高时课程预览表跟着变高，压矮到装不下时
-中间内容区出现滚动条，顶栏和底部按钮始终固定在窗口上。左右缩放时预览表的列宽会自动
-压缩到各列下限，保证右边几列不会被裁掉。
+能，横竖都能拖。默认按界面内容需要给，但**封顶在屏幕宽 55%、高 60%**（约三分之一
+屏幕面积）—— 不会一开窗就铺满屏幕；内容（尤其配置项）比这还多时，中间内容区出现
+滚动条，顶栏和底部按钮始终固定在窗口上。拉高时课程预览表跟着变高。左右缩放时预览表
+的列宽会自动压缩到各列下限，保证右边几列不会被裁掉（实在塞不下才出横向滚动条）。
 
 **卸载后还有残留吗？**
 没有。卸载器会把自己复制到 `%TEMP%` 再执行删除，所以安装目录不被任何进程占用，
