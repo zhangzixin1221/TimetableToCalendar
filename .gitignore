@@ -41,7 +41,8 @@ env/
 /dist/
 /TimetableToCalendar.spec
 TimetableToCalendar.spec
-/uninstaller.exe          # build_installer.ps1 编译的中间产物（会被嵌进安装器）
+# build_installer.ps1 编译的中间产物（会被嵌进安装器）
+/uninstaller.exe
 
 # ---------------------------------------------------------------- 编辑器 / 系统
 .vscode/
