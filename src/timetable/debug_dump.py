@@ -66,7 +66,7 @@ def dump_pdf(pdf_path: str, lay: lay_mod.Layout, pages: Optional[List[int]] = No
             out.extend(_dump_table(spans, lay, rx, max_lines))
             continue
 
-        centres, header_bottom = _find_header(spans, lay)
+        day_indices, centres, header_bottom = _find_header(spans, lay)
         if centres is None:
             add("   ✗ 没找到星期表头（%s）—— 这一页在 %s 模式下读不出来。"
                 % ("、".join(x[0] for x in lay_mod.DAY_ALIASES[:3]), lay.entry_mode))
@@ -74,7 +74,13 @@ def dump_pdf(pdf_path: str, lay: lay_mod.Layout, pages: Optional[List[int]] = No
             shorts = sorted({s["text"].strip() for s in spans if len(s["text"].strip()) <= 6})
             add("     " + "、".join(shorts[:40]))
             continue
-        add("   ✓ 表头列中心 x = %s" % " ".join("%.0f" % c for c in centres))
+        add("   ✓ 表头 %d 列：%s" % (len(day_indices),
+                                    "、".join(lay_mod.DAY_ALIASES[i][0] for i in day_indices)))
+        if len(day_indices) < 7:
+            add("     ⚠ 表头不全（缺 %s）—— 课表可能被裁掉，只打印出一部分"
+                % "、".join(lay_mod.DAY_ALIASES[i][0] for i in range(7)
+                            if i not in day_indices))
+        add("     表头列中心 x = %s" % " ".join("%.0f" % c for c in centres))
         add("     表头底 y = %.1f" % header_bottom)
         gaps = [centres[i + 1] - centres[i] for i in range(len(centres) - 1)]
         add("     列距 = %s（中位数 %.1f）" % (" ".join("%.0f" % g for g in gaps),
@@ -126,7 +132,7 @@ def dump_pdf(pdf_path: str, lay: lay_mod.Layout, pages: Optional[List[int]] = No
                 continue
             lines = _group_into_lines(col_items, lay.col_y_tolerance)
             add("")
-            add("   【%s】%d 行" % (lay_mod.DAY_ALIASES[ci][0], len(lines)))
+            add("   【%s】%d 行" % (lay_mod.DAY_ALIASES[day_indices[ci]][0], len(lines)))
             for ln in lines:
                 if shown >= cap:
                     add("     …（整页只显示前 %d 行，够用来对版式了；要全看就加大 --dump-lines）"

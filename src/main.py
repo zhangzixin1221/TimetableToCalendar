@@ -121,14 +121,20 @@ def _selftest(pdf: str, out_ics: str, report: str) -> int:
                 if a._canvas.yview()[1] < 0.999:
                     bad.append("滚动条滚不到底")
             # 拉大窗口：内容要跟着变大，且滚动条要收起来
-            a.geometry("%dx%d" % (_uk.px(1400), min(_uk.px(950),
-                                                   a.winfo_screenheight() - _uk.px(40))))
+            # 目标高度必须**超过内容需要的高度**，否则"放大"是假的：默认尺寸现在按
+            # 内容算（可能已接近屏幕上限），写死 px(950) 常常够不到内容高，
+            # 预览表自然不变高，自检会误报 FAIL。屏幕实在装不下时就跳过这项验证。
+            target_h = min(a.winfo_screenheight() - _uk.px(40), need + _uk.px(200))
+            a.geometry("%dx%d" % (_uk.px(1400), target_h))
             a.update()
-            lines.append("放大后: 表格=%d 滚动条=%s"
+            lines.append("放大后: 表格=%d 滚动条=%s（目标高 %d / 内容需 %d）"
                          % (a.tree.winfo_height(),
-                            "显示" if a._sb_shown else "隐藏"))
-            if a.tree.winfo_height() <= tree_h:
-                bad.append("窗口放大后预览表没有变高")
+                            "显示" if a._sb_shown else "隐藏", target_h, need))
+            if target_h > need:
+                if a.tree.winfo_height() <= tree_h:
+                    bad.append("窗口放大后预览表没有变高")
+            else:
+                lines.append("注：屏幕装不下「内容高+余量」，跳过放大验证")
             a.destroy()
             if bad:
                 lines.append("布局自检: FAIL " + "、".join(bad))

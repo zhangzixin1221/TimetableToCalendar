@@ -605,6 +605,10 @@ def _parse_detail(text: str, lay: Layout, rx: dict, rest_of: str = "tail"):
         spans.append((pm.start(), pm.end()))
         pfrom = int(pm.group("pfrom"))
         pto = int(pm.group("pto")) if pm.groupdict().get("pto") else pfrom
+        # 节次从 1 起。读到 0 或倒序一定是误读（OCR 把 1 认成 0、或把别的数字
+        # 拼了进来）—— 这种行不算详情行，让它走 warnings，绝不生成「第 0 节」的课。
+        if pfrom < 1 or pto < pfrom:
+            return None
     else:
         spans.append((cm.start(), cm.end()))
         gd = cm.groupdict()
@@ -1021,6 +1025,8 @@ def _table_record(texts: Dict[str, str], course: str, lay: Layout, rx: dict,
             pfrom, pto = int(m2.group(1)), int(m2.group(2))
         elif re.fullmatch(r"\s*\d{1,2}\s*", texts.get("period", "")):
             pfrom = pto = int(texts["period"].strip())
+    if pfrom is not None and (pfrom < 1 or pto < pfrom):   # 节次从 1 起，0/倒序=误读
+        pfrom = pto = None
     if pfrom is None:
         warnings.append("「%s」没解析出节次，已跳过。" % course)
         return []
