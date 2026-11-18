@@ -97,6 +97,11 @@ def _make_parser() -> argparse.ArgumentParser:
     g.add_argument("--dump-layout", action="store_true",
                    help="不生成 .ics，只打印程序从 PDF 里看到的结构（列、行、每条正文行的"
                         "切分结果），用来写/调版式")
+    cg = ap.add_argument_group("OCR 交叉验证（用像素复核文字层的字）")
+    cg.add_argument("--crosscheck", choices=["auto", "on", "off"], default="auto",
+                    help="auto（默认）= 仅当文字层露出可疑迹象时才用 OCR 复核"
+                         "（出现康熙部首/部首补充区字符、cid: 或替换符）；"
+                         "on=总是复核；off=不复核。单页约 5~15 秒")
 
     h = ap.add_argument_group("节假日（默认联网获取，带本地缓存）")
     h.add_argument("--no-holidays", action="store_true",
@@ -268,6 +273,14 @@ def main(argv=None) -> int:
     except Exception as exc:                        # noqa: BLE001
         print("解析失败：%s" % exc, file=sys.stderr)
         return 1
+
+    # ---- OCR 交叉验证：用像素复核文字层的字 ----
+    # 只在「文字层看起来可疑」时自动跑（--crosscheck auto）：健康 PDF 的文字层
+    # 就是原文，跑它只是白等 5~15 秒。
+    if not is_table:
+        from . import crosscheck as xcheck
+        xcheck.run_if_needed(args.pdf, result, lay,
+                             mode=args.crosscheck, log=log)
 
     # ---- 把解析结果导出成 Excel，供人工核对/修改后再导回 ----
     if args.xlsx_out:

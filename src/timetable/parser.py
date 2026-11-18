@@ -235,7 +235,7 @@ def expand_weeks(a: int, b: Optional[int], parity: Optional[str]) -> List[int]:
 
 
 # ---------------------------------------------------------------- 版面几何
-def _collect_spans(page):
+def _collect_spans(page, health=None):
     d = page.get_text("dict")
     spans = []
     for b in d["blocks"]:
@@ -254,10 +254,32 @@ def _collect_spans(page):
                 # 超过 2.5pt 容差的一半，相邻两行直接被并成一行 —— 于是课程名和详情行
                 # 粘在一起、整门课丢信息。基线对同一行是**精确相同**的，用它才稳。
                 base = sp["origin"][1] if "origin" in sp else y0
+                raw = sp["text"]
+                # 记录「文字层可信度」的证据：这些字符是"看着对、码位错"的典型来源。
+                # 有了它才能判断要不要用 OCR 复核（见 crosscheck.py）。
+                if health is not None:
+                    _tally_health(raw, health)
                 spans.append(dict(x0=x0, y0=y0, x1=x1, y1=y1, base=base,
                                   size=round(sp["size"], 2),
-                                  text=normalize_text(sp["text"])))
+                                  text=normalize_text(raw),
+                                  raw_text=raw))
     return spans
+
+
+def _tally_health(raw: str, health: dict) -> None:
+    """统计一段原始文字里有多少"可疑字符"（不改内容，只记数）。"""
+    if not raw:
+        return
+    n_rad = len(_RADICAL_RE.findall(raw)) + len(_KANGXI_RE.findall(raw))
+    if n_rad:
+        health["radical_chars"] = health.get("radical_chars", 0) + n_rad
+        health["radical_spans"] = health.get("radical_spans", 0) + 1
+    if "cid:" in raw:
+        health["cid_chars"] = health.get("cid_chars", 0) + raw.count("cid:")
+    if "\ufffd" in raw:
+        health["replacement_chars"] = (health.get("replacement_chars", 0)
+                                       + raw.count("\ufffd"))
+    health["chars"] = health.get("chars", 0) + len(raw)
 
 
 def _header_labels(lay: Layout) -> List[List[str]]:
@@ -414,11 +436,15 @@ def parse_pdf(pdf_path: str, log=None, layout: Optional[Layout] = None,
         raise RuntimeError("缺少依赖 PyMuPDF，请先执行：pip install pymupdf") from exc
 
     doc = pymupdf.open(pdf_path)
-    pages = [_collect_spans(doc[pno]) for pno in range(doc.page_count)]
+    health: dict = {}
+    pages = [_collect_spans(doc[pno], health) for pno in range(doc.page_count)]
     doc.close()
-    return parse_spans_pages(pages, layout=layout, log=log,
-                             period_times=period_times,
-                             clock_tolerance_min=clock_tolerance_min)
+    result = parse_spans_pages(pages, layout=layout, log=log,
+                               period_times=period_times,
+                               clock_tolerance_min=clock_tolerance_min)
+    # 文字层健康度：给上层决定"要不要用 OCR 复核"用的（见 crosscheck.py）
+    result.stats["text_layer"] = health
+    return result
 
 
 def _with_base(spans) -> list:

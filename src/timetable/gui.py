@@ -86,6 +86,9 @@ class App(tk.Tk):
         # 换学校不用改代码，选一个版式（或用 --layout 载入 JSON 配置）就行。
         self.layout = lay_mod.REGISTRY.get(lay_mod.DEFAULT_LAYOUT_ID)
         self.hol_fetched = None          # 联网取到的 YearHolidays（None=还没取）
+        # 文字层可疑时用 OCR 复核（假汉字/乱码）。默认开：只在可疑时才真跑，
+        # 健康 PDF 不会因此变慢。
+        self.var_crosscheck = tk.BooleanVar(value=True)
         # 当前记录是否来自 OCR。OCR 是"识别"出来的，必须在预览表里一眼看出来，
         # 否则用户会把识别结果当成确定的解析结果直接生成。
         self._from_ocr = False
@@ -422,6 +425,8 @@ class App(tk.Tk):
                                                 padx=(ui.SPACE["xs"], 0))
         mk(w, "（导出的结果改完可直接当课表文件选中）", small=True).pack(
             side="left", padx=(ui.SPACE["sm"], 0))
+        ui.Switch(w, text="可疑文字层用 OCR 复核", variable=self.var_crosscheck).pack(
+            side="left", padx=(ui.SPACE["md"], 0))
 
         # ---- 提示行 ----
         # 这两条提示会随文字长度换行，是配置卡高度跳变的来源。它们的 <Configure>
@@ -1124,6 +1129,15 @@ class App(tk.Tk):
                 # 把用户设定的作息表带进解析：时刻制课表要靠它反查第几节
                 self.result = parse_pdf(pdf, log=self.log, layout=self.layout,
                                         period_times=self.period_times)
+                # 文字层可疑时（假汉字/乱码）用 OCR 复核一遍：文字层管排版，
+                # OCR 只核对"这个字到底是不是这个字"。
+                if self.var_crosscheck.get():
+                    try:
+                        from . import crosscheck as xcheck
+                        xcheck.run_if_needed(pdf, self.result, self.layout,
+                                             mode="auto", log=self.log)
+                    except Exception as exc:               # noqa: BLE001
+                        self.log("（OCR 复核没能完成：%s —— 不影响解析结果）" % exc)
         except XlsxError as exc:
             self.log("Excel 有问题：%s" % exc)
             self._set_status("Excel 有问题", "err")
