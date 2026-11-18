@@ -76,7 +76,7 @@ if ($sample) {
     Copy-Item $sample "$app\sample-timetable.pdf" -Force
     Write-Host "  sample-timetable.pdf（来自 $sample）"
 } else {
-    Write-Host "  （没找到示例课表，跳过；把你的课表 PDF 命名为 sample-timetable.pdf 放在项目根目录即可带上）"
+    Write-Host "  （没找到示例课表，跳过；把你的课表命名为 sample-timetable.pdf 放在项目根目录即可带上）"
 }
 
 foreach ($need in @("TimetableToCalendar.exe", "README.md")) {
