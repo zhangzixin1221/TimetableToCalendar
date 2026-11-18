@@ -41,7 +41,7 @@ DAY_ALIASES: List[List[str]] = [
 # 正则字段里允许的具名分组（写错分组名在载入版式时就会被拦下，不会拖到解析时才发现）
 GROUPS_ALLOWED = {
     "title_re": {"course", "code"},
-    "weeks_re": {"a", "b", "parity"},
+    "weeks_re": {"a", "b", "parity", "list"},
     "period_re": {"pfrom", "pto"},
     "clock_re": {"h1", "m1", "h2", "m2"},
     "clock_range_re": {"h1", "h2"},
@@ -123,25 +123,20 @@ _SCHEDULE_NOISE = re.compile(r"^[0-9〇一二三四五六七八九十,\-~—–(
 # 却肯定是教室而不是人名；早先要求教室必须含数字，这类全被判成「教师在前」失败）
 _PLACE_TAIL = re.compile(r"(楼|室|馆|场|厅|区|中心|基地|堂|园|教室|车间|体育场|体育馆|音乐厅)$")
 
-# 教室与教师**粘在一起**、中间连空格都没有的情况：`040401钱渝`、`10205*温建萍`、
-# `2010205*黄武英`、`4号楼2040401钱渝`。这是「时刻制」课表（如安师大）的典型写法 ——
-# 靠空格切分的所有策略在这种行上都会整体失败（把教师并进教室名）。
-# 切法：结尾那段 2~4 个汉字是教师，前面（必须以数字/字母/星号结尾）是教室。
-# 关键的两个否定条件（都实测踩过）：
-#   * 教师段不能是「号楼」「体育馆」这类地点词 —— 否则 `1号楼` 会被拆成 教室=1、教师=号楼；
-#   * 教室段必须含数字/字母 —— 否则 `翱翔体育馆` 会被当成「教室=翱翔体育 教师=馆」。
-_GLUED_ROOM_TEACHER = re.compile(
-    r"^(?P<room>.*[0-9A-Za-z*#])"
-    r"(?P<teacher>[\u4e00-\u9fff·]{2,4}(?:[/／、,，][\u4e00-\u9fff·]{2,4})*)$")
-# 教师串里可能有多个（`金伟/何淼/朱仁贵`）
-_MULTI_TEACHER = re.compile(r"^[\u4e00-\u9fff·]{2,4}(?:[/／、,，][\u4e00-\u9fff·]{2,4})*$")
-# 这些词尾说明「这段是地点，不是人名」
+# 教室与教师**粘在一起**、中间连空格都没有：`040401钱渝`、`10205*温建萍`、
+# `4号楼2040401钱渝`、`教东报告厅何平`、`工程实践训练中心汪广方/刘婷/…`（40 人）。
+# 一律用「从尾部贪心取教师名单」的办法切，比按两种形态分别写正则稳：
+#   教师名单 = 1~5 个汉字、用 / 、 , 分隔（允许尾随分隔符）。
+# 两个必须保留的否定条件（都实测踩过）：
+#   * 教师段不能以「楼/室/馆/场/厅/区/中心/…」结尾 —— 否则 `1号楼` 会被拆成 教室=1；
+#   * 教室段必须像地点（以数字/字母/星号结尾，或以地点词收尾）—— 否则
+#     `翱翔体育馆` 会被拆成 教室=翱翔体育、教师=馆。
+# 这些词尾说明「这段是地点，不是人名」（`1号楼` 里的「号楼」、`体育馆`）
 _NOT_A_NAME_TAIL = re.compile(r"(号楼|楼|室|馆|场|厅|区|中心|基地|堂|园|号|层|校区)$")
 
-# 纯汉字教室 + 教师粘连（`教东报告厅何平`）
-_GLUED_CJK_ROOM_TEACHER = re.compile(
-    r"^(?P<room>.*(?:楼|室|馆|场|厅|区|中心|基地|堂|园|号|层))"
-    r"(?P<teacher>[\u4e00-\u9fff·]{2,4}(?:[/／、,，][\u4e00-\u9fff·]{2,4})*)$")
+_TEACHER_LIST_RE = re.compile(
+    r"(?P<teacher>[\u4e00-\u9fff·]{1,5}"
+    r"(?:[/／、,，][\u4e00-\u9fff·]{1,5})*[/／、,，]?)$")
 
 
 def _looks_like_room(tok: str) -> bool:
@@ -151,24 +146,34 @@ def _looks_like_room(tok: str) -> bool:
 def _split_glued(whole: str, squeeze) -> Optional[Tuple[str, str]]:
     """把「教室+教师粘在一起、中间没有空格」的一段拆开；拆不出来返回 None。
 
-    两种形态：
-      1. 教室含数字/字母：`040401钱渝`、`2号楼2020104*郭文梅`、`4号楼2040401钱渝`
-         —— 教师段之前的字符必须是数字/字母/星号；
-      2. 教室是**纯汉字地点**：`教东报告厅何平`、`翱翔体育馆张伟`
-         —— 教室段以「楼/室/馆/场/厅/区/中心/基地」等地点词收尾。
+    做法：从**尾部**贪心取「教师名单」（1~5 汉字，可用 / 、 , 分隔，允许尾随分隔符），
+    剩下的当教室；再校验两边都像它该像的东西。这样一个实现同时覆盖：
+      `040401钱渝`、`2号楼2020104*郭文梅`、`教东报告厅何平`、
+      `工程实践训练中心汪广方/刘婷/…（40 人）`、`教西B2-304杨云霞/宋保维`。
 
-    两条都带同一个否定条件：教师段不能是地点词（否则 `1号楼` 会被拆成
-    教室=1、教师=号楼）。宁可拆不出来（教师并进教室名，用户能在预览表看到），
-    也不要把地点词当人名（那是"张冠李戴"，更误导）。
+    两道门（都实测踩过，缺一不可）：
+      * 教师不能以地点词结尾 —— 否则 `1号楼` 被拆成 教室=1、教师=号楼；
+      * 教室必须像地点 —— 否则 `翱翔体育馆` 被拆成 教室=翱翔体育、教师=馆。
+    拆不出来就整段当教室：宁可教师并进教室名（用户在预览表里看得见），
+    也不要把地点词当人名（那是张冠李戴，更误导）。
     """
-    m = _GLUED_ROOM_TEACHER.match(whole)
-    if m and _MULTI_TEACHER.match(m.group("teacher")) \
-            and not _NOT_A_NAME_TAIL.search(m.group("teacher")):
-        return squeeze(m.group("room")), squeeze(m.group("teacher"))
-    m2 = _GLUED_CJK_ROOM_TEACHER.match(whole)
-    if m2 and _MULTI_TEACHER.match(m2.group("teacher")) \
-            and not _NOT_A_NAME_TAIL.search(m2.group("teacher")):
-        return squeeze(m2.group("room")), squeeze(m2.group("teacher"))
+    n = len(whole)
+    # 从**短切点往长**找（教室由短到长）：第一个两端都成立的切点就是答案。
+    # 反过来从尾部倒着找会先在长名单中间断开 —— 实测一门实验课列了 40 位教师，
+    # 倒序搜索会在名单内部切出一个"教师="、房间尾巴带 `李强/` 的假切点。
+    for cut in range(1, n):
+        teacher = whole[cut:]
+        room = whole[:cut].rstrip("/／、,，")      # 教室尾巴可能残留分隔符
+        if not room or not teacher:
+            continue
+        if not _TEACHER_LIST_RE.fullmatch(teacher):
+            continue
+        t_core = teacher.rstrip("/／、,，")
+        if not t_core or _NOT_A_NAME_TAIL.search(t_core):
+            continue
+        if not (re.search(r"[0-9A-Za-z*#]$", room) or _PLACE_TAIL.search(room)):
+            continue
+        return squeeze(room), squeeze(t_core)
     return None
 
 
@@ -200,6 +205,17 @@ def _space_tail_auto(rest: str, squeeze) -> Tuple[str, str]:
             return glued
     if len(parts) == 1:
         return squeeze(parts[0]), ""
+
+    # 规则 A：**第一个 token 就是地点**，后面全是汉字/斜杠 → 地点 + 教师名单。
+    # 这条专治「多教师名单被折行截断」：实测一门实验课列了 40 位教师，
+    # 断成 `工程实践训练中心 汪广方/刘婷/李` + `伟/许民/…`，任何「最后一个 token
+    # 必须是完整人名」的判据都会失败，而这里只要认准第一个地点词就够了。
+    first = parts[0]
+    if _looks_like_room(first) and not _SCHEDULE_NOISE.match(first) \
+            and all(re.fullmatch(r"[\u4e00-\u9fff·/／、,，]+", p) for p in parts[1:]):
+        return squeeze(first), squeeze("".join(parts[1:]))
+
+    last = parts[-1]
     last, prev = parts[-1], parts[-2]
     if _looks_like_room(last) and re.fullmatch(r"[\u4e00-\u9fff·]{2,4}", prev):
         prefix = [p for p in parts[:-2] if not _SCHEDULE_NOISE.match(p)]
@@ -269,7 +285,11 @@ class Layout:
     # --- 网格定位
     entry_mode: str = "block"                  # block | inline | table
     day_headers: List[List[str]] = field(default_factory=lambda: [list(x) for x in DAY_ALIASES])
-    min_day_columns: int = 7                   # 至少要认全 7 天才认为是课表网格
+    # 至少要认出几个星期表头才认为是课表网格。
+    # 通用版式放到 3：网页打印的课表常只印出前几列（实测一份只有周一~周四），
+    # 那种也要能读 —— 但 parser 会明确警告"缺哪几天、可能不完整"。
+    # 写死的学校版式可以要求 7（版面固定，少一天就说明认错了）。
+    min_day_columns: int = 3
     col_y_tolerance: float = 2.5               # 同一视觉行的 y 容差（像素/磅）
 
     # --- 条目与详情行
@@ -482,7 +502,9 @@ GENERIC = Layout(
     specificity=25,                 # 比写死括号的版式宽松，但结构要求仍然具体
     # 课程代码放宽到 2~4 位（`078`、`001`、`20`），并允许代码前有空格或全角括号
     title_re=r"^[^(\s].*?[\s（(]?(?P<code>\d{2,4})$",
-    weeks_re=r"[(（]?(?P<a>\d{1,2})(?:\s*[-~—–至]\s*(?P<b>\d{1,2}))?"
+    weeks_re=r"[(（]?(?P<a>\d{1,2})"
+             r"(?P<list>(?:\s*[-~—–至]\s*\d{1,2})?"
+             r"(?:\s*[,，、]\s*\d{1,2}(?:\s*[-~—–至]\s*\d{1,2})?)*)"
              r"\s*(?:[(（](?P<parity>[单双])[)）])?\s*周[)）]?",
     period_re=r"[(（]?(?P<pfrom>\d{1,2})(?:\s*[-~—–至]\s*(?P<pto>\d{1,2}))?\s*节[)）]?",
     # 时刻制：`(800-935)` = 8:00–9:35，`(1430-1655)` = 14:30–16:55

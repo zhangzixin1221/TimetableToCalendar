@@ -357,6 +357,79 @@ if os.path.isfile(FIX):
     except RuntimeError as exc:
         check("没有任何版式读得出时必须报错", "读不出" in str(exc), str(exc)[:60])
 
+# ============================================================ 8) 真实世界写法
+# 下面这些用例全部来自真实的学校课表（脱敏后用等价字符串固化）。
+# 真实 PDF 含姓名/学号，不进仓库；但导致 bug 的**写法**必须进回归。
+print("[8] 真实课表的写法（字符归一 / 部分表头 / 折行 / 多教师 / 周次列表）")
+from timetable.parser import (normalize_text, has_unmapped_radicals,  # noqa: E402
+                              _parse_detail, _merge_unbalanced,
+                              _find_header, parse_spans_pages)
+
+# 8.1 「康熙部首」伪装成常用字：网页打印的 PDF 常见（⻄ 不是 西，⼀ 不是 一）
+check("部首字符被还原成正常汉字（⼀->一、⼯->工、⽣->生）",
+      normalize_text("星期⼀") == "星期一"
+      and normalize_text("船舶与海洋⼯程") == "船舶与海洋工程"
+      and normalize_text("学⽣") == "学生")
+check("NFKC 管不到的 CJK 部首补充区也有手工映射（⻄->西、⺠->民、⻩->黄）",
+      normalize_text("⻄北⼯业⼤学") == "西北工业大学"
+      and normalize_text("⺠族") == "民族" and normalize_text("⻩河") == "黄河")
+check("普通文本一字不改（不能把全角括号/冒号也改掉）",
+      normalize_text("体育（篮球）") == "体育（篮球）"
+      and normalize_text("形势与政策（2）") == "形势与政策（2）")
+check("映射表覆盖不到的部首能被告知（不静默）",
+      has_unmapped_radicals("⺀") and not has_unmapped_radicals("星期一"))
+
+# 8.2 表头不全（网页打印只印出前几列）：要能读，但必须明确警告不完整
+four_days = [dict(x0=100 + i * 110, y0=100, x1=150 + i * 110, y1=110,
+                  base=108, size=9.0, text=n)
+             for i, n in enumerate(["星期一", "星期二", "星期三", "星期四"])]
+body = [dict(x0=110, y0=130, x1=200, y1=140, base=136, size=7.0,
+             text="高等数学06")]
+body += [dict(x0=112, y0=150, x1=200, y1=160, base=156, size=7.0,
+              text="(1~16周)(1-2节)教西A-301 王聪")]
+res4 = parse_spans_pages([four_days + body], layout=lay_mod.REGISTRY.get("generic"))
+check("只有 4 个星期表头也能解析（不再直接报「没找到表头」）",
+      len(res4.records) == 1, len(res4.records))
+check("但必须警告「缺周五~周日、课表可能不完整」",
+      any("缺" in w and "周五" in w for w in res4.warnings), res4.warnings)
+
+# 8.3 折行断在括号中间：`(4~15` + `周)(3` + `-4节)` 要能接回
+frag = [dict(text="(4~15", size=7.0, y=1, ybase=1, spans=[]),
+        dict(text="周)(3", size=7.0, y=2, ybase=2, spans=[]),
+        dict(text="-4节)教西B2-201 付", size=7.0, y=3, ybase=3, spans=[]),
+        dict(text="全红", size=7.0, y=4, ybase=4, spans=[])]
+merged = _merge_unbalanced(frag)
+check("括号差 1 时接上紧邻一行（不贪多）", len(merged) == 3, len(merged))
+joined = "".join(m["text"] for m in merged[:2])
+check("接完能认出周次+节次",
+      _parse_detail(joined, lay_mod.REGISTRY.get("generic"),
+                    lay_mod.REGISTRY.get("generic").compiled()) is not None, joined[:30])
+# 差 2 个以上不合并（否则 OCR 漏括号会吞掉一整列）
+frag2 = [dict(text="((1~8", size=7.0, y=1, ybase=1, spans=[]),
+         dict(text="周)(1-2节)", size=7.0, y=2, ybase=2, spans=[])]
+check("括号差 2 以上不合并（OCR 常漏括号，贪心会吞整列）",
+      len(_merge_unbalanced(frag2)) == 2)
+
+# 8.4 多教师名单被折行截断（一门实验课列了 40 位教师）
+G = lay_mod.REGISTRY.get("generic")
+big = ("工程实践训练中心 汪广方/刘婷/李 伟/许民/黄晓秋/邓琳/王伯民/赵春生")
+check("教室 + 被折行的多教师名单能拆对",
+      lay_mod.split_room_teacher(big, "auto")[0] == "工程实践训练中心"
+      and lay_mod.split_room_teacher(big, "auto")[1].startswith("汪广方/刘婷/李伟"),
+      lay_mod.split_room_teacher(big, "auto"))
+check("`教西B2-304杨云霞/宋保维` 无空格也拆对",
+      lay_mod.split_room_teacher("教西B2-304杨云霞/宋保维", "auto")
+      == ("教西B2-304", "杨云霞/宋保维"))
+
+# 8.5 周次写成逗号列表 `(2~6,8~17周)`：以前只吃到后半段
+RXG = G.compiled()
+d5 = _parse_detail("(2~6,8~17周) (7-8节) 教西B3-101 余书涵", G, RXG)
+check("逗号列表周次要全收（2~6、8~17），不能只取后半段",
+      d5 and compress_weeks(d5["weeks"]) == "2~6、8~17",
+      d5 and compress_weeks(d5["weeks"]))
+d6 = _parse_detail("(1~16周) (1-2节) 教西A-301 王聪", G, RXG)
+check("普通区间周次不受影响", d6 and compress_weeks(d6["weeks"]) == "1~16")
+
 # ============================================================ 结果
 print("\n" + "=" * 78)
 for st, label, extra in cases:

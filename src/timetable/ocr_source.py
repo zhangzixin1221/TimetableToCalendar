@@ -130,13 +130,17 @@ _FULLWIDTH.update({ord("（"): ord("("), ord("）"): ord(")"),
 
 
 def _normalize(text: str) -> str:
-    """OCR 文本归一：全角 ASCII -> 半角。
+    """OCR 文本归一：无条件 NFKC（全角->半角）+ 部首字符映射。
 
     为什么要做：OCR 对同一串 `A-302` 可能输出 `A－302`（全角减号），对 `(上)` 可能
     输出 `（上）`。这会让「同一门课」因为一个字符的宽度差异变成两条记录、让教室名
     对不上。归一化只影响**比较与去重**，中文本身不动。
+
+    与 PDF 路径的区别：PDF 的文字层是"原文"，除非遇到部首字符否则不该改动
+    （见 parser.normalize_text）；OCR 的输出本来就是"重排的"，可以放开归一。
     """
-    return (text or "").translate(_FULLWIDTH)
+    from .parser import normalize_text
+    return normalize_text(text, aggressive=True)
 
 
 def ocr_image_to_spans(image_path: str, log=None) -> List[dict]:

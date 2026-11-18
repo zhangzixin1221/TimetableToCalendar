@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -156,6 +157,56 @@ class ParseResult:
     layout_id: str = ""
 
 
+# ---------------------------------------------------------------- 文本归一化
+# 有些教务系统（尤其是**网页打印成 PDF**）会把常用汉字写成「康熙部首 / CJK 部首补充」
+# 区的字符：肉眼一模一样，码位却不同。实测一份这样的课表里有 141 个这样的字符
+# （`⼯` U+2F2F 不是「工」U+5DE5，`⽣` U+2F63 不是「生」），于是
+#   * 「星期一」匹配不上表头 -> 整份报「没找到星期表头」；
+#   * 课程名/教室/教师全是"看着对、比较全不等"的字符串。
+# NFKC 能把「康熙部首」区（U+2F00–U+2FDF）还原成正常汉字，但**管不到**
+# 「CJK 部首补充」区（U+2E80–U+2EFF）—— 那批字符没有兼容分解，只能手工映射。
+_RADICAL_MAP = {
+    # 实测遇到的（无 NFKC 分解，必须手工）
+    "\u2EC4": "西", "\u2EA0": "民", "\u2EE9": "黄", "\u2EE2": "马", "\u2EF0": "龙",
+    # 同一区里常见、容易出现在校名/课程名里的
+    "\u2E8C": "小", "\u2E95": "网", "\u2EA1": "水", "\u2EA6": "火", "\u2EB6": "月",
+    "\u2EC1": "虎", "\u2EC6": "见", "\u2EDB": "言", "\u2EE0": "足", "\u2EEC": "鱼",
+    "\u2EF6": "齿", "\u2EF4": "鸟",
+}
+_RADICAL_RE = re.compile(r"[\u2E80-\u2EFF]")
+# 康熙部首区（U+2F00–U+2FDF）：NFKC 会把它们还原成正常汉字
+_KANGXI_RE = re.compile(r"[\u2F00-\u2FDF]")
+
+
+def normalize_text(s: str, aggressive: bool = False) -> str:
+    """把「看着一样、码位不同」的字符统一成正常汉字。
+
+    **默认只在必要时动**（aggressive=False）：
+      * 只有发现「康熙部首 / CJK 部首补充」区字符时才做 NFKC —— 因为 NFKC 是整体
+        转换，会把全角括号、全角冒号也变成半角，从而改掉**本来正常**的课程名
+        （实测把「体育（篮球）」改成「体育(篮球)」，把 fixture 断言弄红）。
+        普通 PDF 的原文应当一字不改。
+      * 含部首字符时：NFKC 处理康熙部首区，再对「CJK 部首补充」区（NFKC 管不到）
+        走手工映射。
+    aggressive=True 时无条件 NFKC —— 给 OCR 文本用：OCR 输出的全角/半角混用
+    （`Ａ－302`、`（上）`）必须归一，否则同一门课会因宽度差异变成两条记录。
+    """
+    if not s:
+        return s
+    radical = bool(_RADICAL_RE.search(s)) or bool(_KANGXI_RE.search(s))
+    if not (aggressive or radical):
+        return s
+    s = unicodedata.normalize("NFKC", s)
+    if _RADICAL_RE.search(s):
+        s = s.translate(str.maketrans(_RADICAL_MAP))
+    return s
+
+
+def has_unmapped_radicals(s: str) -> bool:
+    """还有没被映射掉的部首字符（用来在解析结果里明确提示，而不是静默错）。"""
+    return bool(s and _RADICAL_RE.search(s))
+
+
 # --------------------------------------------------------------------- helpers
 def compress_weeks(weeks: List[int]) -> str:
     """[1,2,3,5] -> '1~3、5'"""
@@ -204,7 +255,8 @@ def _collect_spans(page):
                 # 粘在一起、整门课丢信息。基线对同一行是**精确相同**的，用它才稳。
                 base = sp["origin"][1] if "origin" in sp else y0
                 spans.append(dict(x0=x0, y0=y0, x1=x1, y1=y1, base=base,
-                                  size=round(sp["size"], 2), text=sp["text"]))
+                                  size=round(sp["size"], 2),
+                                  text=normalize_text(sp["text"])))
     return spans
 
 
@@ -216,7 +268,15 @@ def _header_labels(lay: Layout) -> List[List[str]]:
 
 
 def _find_header(spans, lay: Layout):
-    """返回 (centres, header_bottom)；找不到表头返回 (None, None)。"""
+    """找星期表头，返回 (day_indices, centres, header_bottom)；找不到返回 (None, None, None)。
+
+    `day_indices` 是每个找到的列对应的星期序号（0=周一…6=周日）。之所以不假设
+    「一定是从周一数到周日、连续 7 列」：
+      * 有些学校周日起头（列序与序号不同）；
+      * **网页打印的课表常常只有前几列**（实测一份只有 星期一~星期四 —— 表格被裁掉
+        或者页面只显示了左半边）。这种必须能读，但要在结果里明确警告"课表可能不完整"，
+        否则用户会以为拿到的是整学期课表。
+    """
     labels = _header_labels(lay)
     found: Dict[int, List[dict]] = {}
     for s in spans:
@@ -227,19 +287,13 @@ def _find_header(spans, lay: Layout):
                 break
     need = max(1, min(lay.min_day_columns, 7))
     if len(found) < need:
-        return None, None
-    picked = []
-    for i in range(need):
-        if i not in found:
-            return None, None
-        picked.append(min(found[i], key=lambda z: z["y0"]))
-    pairs = sorted([(s["x0"] + s["x1"]) / 2.0, i, s["y1"]] for i, s in enumerate(picked))
-    # 表头文字可能不是按 周一…周日 从左到右排（有些学校周日起头），按 x 排完再还原列号
-    order = [idx for _, idx, _ in pairs]
-    if order != sorted(order):
-        return None, None
-    centres = [c for c, _, _ in pairs]
-    return centres, max(y for _, _, y in pairs)
+        return None, None, None
+    picked = [(i, min(found[i], key=lambda z: z["y0"])) for i in sorted(found)]
+    picked.sort(key=lambda kv: (kv[1]["x0"] + kv[1]["x1"]) / 2.0)   # 按 x 从左到右
+    day_indices = [i for i, _ in picked]
+    centres = [(s["x0"] + s["x1"]) / 2.0 for _, s in picked]
+    header_bottom = max(s["y1"] for _, s in picked)
+    return day_indices, centres, header_bottom
 
 
 def _group_into_lines(items, tol: float) -> List[dict]:
@@ -398,14 +452,16 @@ def _spans_text(spans) -> str:
     lines = []
     for base in sorted(by_base):
         row = sorted(by_base[base], key=lambda z: z["x0"])
-        lines.append("".join(z["text"] for z in row))
+        # span 之间补一个空格再做「多空格折叠」。不补的话相邻字段会粘成一串
+        # （`年级:2025学院:航海学院`），标签后的取值会贪到整行、被合理性校验丢掉。
+        lines.append(re.sub(r"\s+", " ", " ".join(z["text"] for z in row)).strip())
     return "\n".join(lines)
 
 
 def _parse_grid_page(spans, lay: Layout, rx: dict, result: ParseResult,
                      pno: int, warnings: List[str]) -> List[Record]:
     """解析「网格」型页面（block / inline 模式）。"""
-    centres, header_bottom = _find_header(spans, lay)
+    day_indices, centres, header_bottom = _find_header(spans, lay)
     if centres is None:
         if pno == 0:
             raise RuntimeError(
@@ -413,11 +469,21 @@ def _parse_grid_page(spans, lay: Layout, rx: dict, result: ParseResult,
                 % lay.name)
         return []
     result.stats["header_found"] = result.stats.get("header_found", 0) + 1
+    # 表头不全时必须说出来：网页打印的课表常常只印出前几列（实测一份只有周一~周四），
+    # 静默按 4 天解析会让用户以为这就是整学期课表。
+    if len(day_indices) < 7:
+        missing = [WEEKDAY_SHORT[i] for i in range(7) if i not in day_indices]
+        warnings.append(
+            "只识别到 %d 个星期表头（%s），缺 %s —— 课表可能被裁掉/只打印出一部分，"
+            "请在预览表里核对是否完整。"
+            % (len(day_indices),
+               "、".join(WEEKDAY_SHORT[i] for i in day_indices),
+               "、".join(missing)))
 
     gaps = [centres[i + 1] - centres[i] for i in range(len(centres) - 1)]
-    step = sorted(gaps)[len(gaps) // 2]
+    step = sorted(gaps)[len(gaps) // 2] if gaps else 0
     bounds = [(centres[i] + centres[i + 1]) / 2.0 for i in range(len(centres) - 1)]
-    col_left = centres[0] - step / 2.0
+    col_left = centres[0] - (step / 2.0 if step else 0)
 
     body_bottom = max(s["y1"] for s in spans) + 1
     for s in spans:
@@ -443,13 +509,15 @@ def _parse_grid_page(spans, lay: Layout, rx: dict, result: ParseResult,
     result.stats["body_spans"] = result.stats.get("body_spans", 0) + len(body)
 
     out: List[Record] = []
-    for ci in range(len(centres)):
+    for ci, day in enumerate(day_indices):
         lines = _group_into_lines([s for s in body if s["col"] == ci],
                                   lay.col_y_tolerance)
+        # 折行可能把「(4~15周)(3-4节)」断成几段，先按括号配对把同一逻辑行接回来
+        lines = _merge_unbalanced(lines, rx)
         if lay.entry_mode == "inline":
-            out.extend(_parse_inline_column(ci, lines, lay, rx, warnings))
+            out.extend(_parse_inline_column(day, lines, lay, rx, warnings))
         else:
-            out.extend(_parse_block_column(ci, lines, lay, rx, warnings))
+            out.extend(_parse_block_column(day, lines, lay, rx, warnings))
     return out
 
 
@@ -526,9 +594,7 @@ def _parse_detail(text: str, lay: Layout, rx: dict, rest_of: str = "tail"):
     cut = max(e for _, e in spans)
     head_end = min(s for s, _ in spans)
     rest = text[cut:] if rest_of == "tail" else text[:head_end]
-    weeks = expand_weeks(int(wm.group("a")),
-                         int(wm.group("b")) if wm.groupdict().get("b") else None,
-                         wm.groupdict().get("parity"))
+    weeks = _weeks_from_match(wm)
     return dict(weeks=weeks, pfrom=pfrom, pto=pto, clock=clock,
                 head=re.sub(r"[\s:：,，、\-]+$", "", text[:head_end]).strip(),
                 rest=re.sub(r"\s+", " ", rest).strip())
@@ -559,6 +625,71 @@ def _course_from_head(head: str, lay: Layout, rx: dict) -> Tuple[str, str]:
 
 
 # ---- block 模式：标题行 + 详情行（西工大） ------------------------------------
+def _merge_unbalanced(lines: List[dict], rx: Optional[dict] = None) -> List[dict]:
+    """把「括号没闭合」的行与**紧邻的一行**合并（有严格上限，别贪）。
+
+    真实课表（尤其是网页打印/窄表格）会把一个逻辑行折成几段，断点可能落在括号中间：
+    实测 `(4~15` / `周)(3` / `-4节)` 三行，任何一行单独看都不是「周次+节次」，
+    于是被判成"续行"拼进上一门课的教室，导致整门课错位。
+
+    但这条规则必须**保守**：OCR 文本经常漏掉一个右括号（识别不全），如果"只要不配平
+    就一直往下接"，一整列内容会被吞成一行（实测 OCR 用例的记录数从 25 掉到 18）。
+    所以限制三条：
+      * 只补**一个**缺失的右括号（差 1 才合并，差 2 以上当作本来就是残缺文本）；
+      * 最多再吞**一行**；
+      * 下一行若本身像课程标题（匹配 title_re），不许吞 —— 那是另一门课。
+    """
+    if not lines:
+        return lines
+    out: List[dict] = []
+    i = 0
+    while i < len(lines):
+        cur = dict(lines[i])
+        text = cur["text"]
+        for _ in range(1):                      # 最多再吞一行
+            miss = (text.count("(") + text.count("（")
+                    - text.count(")") - text.count("）"))
+            if miss != 1 or i + 1 >= len(lines):
+                break
+            nxt = lines[i + 1]
+            if rx and rx.get("title_re") and rx["title_re"].match(nxt["text"]):
+                break                           # 下一行是另一门课的标题，别吞
+            text = text + nxt["text"]
+            cur["size"] = nxt["size"]
+            i += 1
+        cur["text"] = text
+        out.append(cur)
+        i += 1
+    return out
+
+
+def _weeks_from_match(wm) -> List[int]:
+    """把 weeks_re 的匹配结果展开成周次列表。
+
+    优先用 `expand_weeks_token` 展开**整段匹配文本** —— 它已经能处理
+    `1~16`、`2~4(双)`、`2~6,8~17`、`第3周` 这些写法，一个入口覆盖全部，
+    不会出现「某一种写法只吃到一半、另一半被静默丢掉」的问题
+    （实测 `(2~6,8~17周)` 以前只得到 8~17，日历上少排了 2~6 周）。
+    展开失败才退回 a/b 分组的老逻辑。
+    """
+    text = (wm.group(0) or "").strip().strip("()（）").strip()
+    try:
+        got = expand_weeks_token(text)
+        if got:
+            return got
+    except LayoutError:
+        pass
+    gd = wm.groupdict()
+    a = int(gd["a"])
+    b = int(gd["b"]) if gd.get("b") else None
+    return expand_weeks(a, b, gd.get("parity"))
+
+
+def _is_cjk(ch: str) -> bool:
+    """这个字符是不是汉字（用于判断换行是断在词中间还是断在字段之间）。"""
+    return bool(ch) and ("\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf")
+
+
 def _entry_has_detail(ent: dict, lay: Layout, rx: dict) -> bool:
     """这一条目里是否已经有「周次 + (节次 或 时刻)」的正文行。
 
@@ -629,16 +760,21 @@ def _parse_entry(day: int, ent: dict, lay: Layout, rx: dict,
             notes.append(text)
             continue
         if details:
-            # 换行续行拼接：补一个空格再接。
-            # 教室与教师的分隔本来就是一个空格；如果排版正好在**那个空格上**断了行
-            # （第一行 "教西D-101"、第二行 "陈明远"），不加空格拼会得到
-            # "教西D-101陈明远" —— 教师被整段吃进教室名。加了空格也不伤害另一种断法
-            # （名字中间断，如 "实验大楼C座" + "5楼 向礼琴"），因为教室名内部的空格
-            # 最后一定会被 squeeze 掉。
+            # 换行续行拼接。这里有两种断行，必须区别对待：
+            #   ① 断在「教室」和「教师」之间（`教西D-101` / `陈明远`）→ 要补空格，
+            #      否则教师被并进教室名；
+            #   ② 断在**词中间**（网页打印/窄表格常见：`孙` / `荧`，`教西` / `A-301`）
+            #      → 不能补空格，否则人名/教室名被空格劈开，后面再也切不回来。
+            # 判据：两侧都是汉字 → 词内断行（不补空格）；否则（一边是数字/字母/符号
+            # 或一边是汉字）→ 字段边界（补空格）。
             prev_rest = details[-1]["rest"]
             add = text.strip()
-            details[-1]["rest"] = (prev_rest + " " + add) if (prev_rest and add) \
-                else (prev_rest or add)
+            if prev_rest and add:
+                both_cjk = _is_cjk(prev_rest[-1]) and _is_cjk(add[0])
+                details[-1]["rest"] = prev_rest + add if both_cjk \
+                    else prev_rest + " " + add
+            else:
+                details[-1]["rest"] = prev_rest or add
         else:
             notes.append(text)
 
@@ -963,7 +1099,13 @@ def _parse_meta(text: str, lay: Layout, rx: dict) -> Meta:
     text = text or ""
 
     def grab(label, own=""):
-        m = re.search(re.escape(label) + r"\s*([^\s]+)", text)
+        # 标签本身也要归一：版式里写的是全角「年级：」，而 NFKC 会把正文里的全角冒号
+        # 变成半角「年级:」，不归一就一个也匹配不上（实测这份网页打印 PDF 就是这样）。
+        lab = normalize_text(label)
+        m = re.search(re.escape(lab) + r"\s*([^\s]+)", text)
+        if m is None:
+            # 再退一步：冒号全半角都试（标签里没有冒号时这条不生效）
+            m = re.search(re.escape(lab.rstrip(":：")) + r"\s*[:：]?\s*([^\s]+)", text)
         return _plausible(m.group(1), own, labels) if m else ""
 
     labels = tuple((lay.meta_labels or {}).values())
